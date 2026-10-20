@@ -17,6 +17,7 @@ outputs/
 *.jpeg
 *.png
 camtest*.jpg
+*_food.jpg
 
 # OS / editor
 .DS_Store

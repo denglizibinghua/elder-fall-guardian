@@ -2,11 +2,16 @@
 #   pip install -r requirements.txt
 #
 # fall_fusion.py + webapp/app.py use only the standard library.
-# Everything below is needed only by main_pi.py on real hardware.
+# Everything below is needed only by main.py on real hardware.
+#
+# NOTE (2026-10-20 cleanup):
+#   - removed `requests`: the old backend HTTP reporting was deleted
+#     (its URLs pointed at a dead 127.0.0.1:9 black-hole port).
+#   - added `paho-mqtt`: main.py publishes alarm/button/status to a local broker.
 
 RPi.GPIO
 smbus2
 pyserial
-requests
+paho-mqtt
 adafruit-blinka
 adafruit-circuitpython-dht

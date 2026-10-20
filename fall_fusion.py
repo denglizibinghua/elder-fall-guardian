@@ -111,36 +111,6 @@ def accel_magnitude(ax: float, ay: float, az: float) -> float:
     return math.sqrt(float(ax) * float(ax) + float(ay) * float(ay) + float(az) * float(az))
 
 
-def is_spike(mag: float, baseline: float = 16384.0, spike_threshold: float = 25000.0) -> bool:
-    """True when a magnitude sample counts as an impact spike.
-
-    The comparison is absolute (``mag > spike_threshold``), matching the step
-    detector style in ``main_pi.py`` (``curr_mag > step_threshold`` with
-    ``step_threshold = 25000``). ``baseline`` documents the 1g rest level and
-    is used by callers reasoning about "jump vs 1g"; the threshold itself is
-    the operative gate.
-    """
-    return mag > spike_threshold
-
-
-def pick_primary_target(targets) -> dict | None:
-    """Return the first valid radar target, or None.
-
-    Mirrors ``main_pi.py``: ``valid_targets = [t for t in curr_targets
-    if t['dist'] > 0]`` and then ``valid_targets[0]``. A target with
-    ``dist <= 0`` (or missing keys) means "no person tracked in this slot".
-    """
-    if not targets:
-        return None
-    for t in targets:
-        try:
-            if float(t.get("dist", 0)) > 0:
-                return t
-        except (TypeError, ValueError, AttributeError):
-            continue
-    return None
-
-
 def target_speed(target: dict | None) -> float | None:
     """Extract ``|speed|`` from a target dict, or None if unusable."""
     if target is None:
@@ -535,71 +505,24 @@ class FallDetector:
 # Button GPIO17 -- immediate FALL alarm source
 # ---------------------------------------------------------------------------
 
-def button_pressed_to_event(detail: str = "button GPIO17 pressed", now: float | None = None) -> dict:
+def button_pressed_to_event(detail: str = "button GPIO17 pressed") -> dict:
     """Build the immediate FALL event for a press of the button on GPIO17.
 
     The button (BCM pin 17, see ``BUTTON_PIN``) is the manual help call: unlike
     the fusion path it needs no spike/stillness evidence and no cooldown is
-    applied here -- the caller (``main_pi.py`` sensor_loop) decides debouncing
-    and logging, e.g. ``det._emit_fall(...)`` or its own POST. Pin monitoring
-    itself (GPIO.setup/input) stays in ``main_pi.py``; hardware is NOT touched
-    in this module so it stays import-safe and testable.
+    applied here -- the caller (``main.py``) decides debouncing and logging via
+    ``det._emit_fall(...)``. Pin monitoring itself (GPIO.setup/input) stays in
+    ``main.py``; hardware is NOT touched in this module so it stays
+    import-safe and testable.
 
     Returns:
         Event dict ``{time, type: "FALL", detail}`` naming GPIO17 as source.
     """
-    _ = now  # accepted for signature symmetry with detector updates
     return {
         "time": utc_now_iso(),
         "type": "FALL",
         "detail": f"{detail} (immediate alarm source: button GPIO{BUTTON_PIN})",
     }
-
-
-# ---------------------------------------------------------------------------
-# Lazy-hardware helpers (only place RPi.GPIO / smbus may be imported)
-# ---------------------------------------------------------------------------
-
-def read_live_mpu(bus_index: int = 1, addr: int = 0x68):
-    """Read one live (ax, ay, az) tuple from the MPU6050. Lazy-imports smbus.
-
-    Mirrors ``main_pi.py``: bus ``1``, addr ``0x68``, base ``ACCEL_XOUT_H``.
-    Raises the underlying exception on failure (caller handles it).
-    """
-    import smbus2 as smbus  # lazy: keeps module import hardware-free
-
-    base = 0x3B
-
-    def _raw(bus, reg: int) -> int:
-        high = bus.read_byte_data(addr, reg)
-        low = bus.read_byte_data(addr, reg + 1)
-        value = (high << 8) | low
-        return value - 65536 if value > 32768 else value
-
-    bus = smbus.SMBus(bus_index)
-    return (_raw(bus, base), _raw(bus, base + 2), _raw(bus, base + 4))
-
-
-def wait_for_button_press(poll_s: float = 0.05):
-    """Block until the GPIO17 button is pressed. Lazy-imports RPi.GPIO.
-
-    Convenience for scripts that want the manual alarm path outside
-    ``main_pi.py``. Returns the FALL event dict from button_pressed_to_event().
-    """
-    import RPi.GPIO as GPIO  # lazy: keeps module import hardware-free
-
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    last = GPIO.input(BUTTON_PIN)
-    try:
-        while True:
-            cur = GPIO.input(BUTTON_PIN)
-            if cur == GPIO.HIGH and last == GPIO.LOW:
-                return button_pressed_to_event()
-            last = cur
-            time.sleep(poll_s)
-    finally:
-        GPIO.cleanup()
 
 
 # ---------------------------------------------------------------------------
@@ -772,8 +695,6 @@ def _case_transition_old_walk_far_no_fall():
     at stillness-confirm time the last ACTIVE frame is ~11 s stale, so no
     FALL may fire (SUSPECT/None only).
     """
-    import tempfile
-
     det = FallDetector(alarm_file=os.devnull, alarm_mode="transition")
     t0 = 1_700_000_000.0
     for i in range(10):  # 1 s walking
@@ -798,8 +719,6 @@ def _case_teleport_decoy_no_fall():
     nearest-neighbor with pos_gate ignores the decoy: stillness on the
     real target keeps accumulating.
     """
-    import tempfile
-
     det = FallDetector(
         alarm_file=os.devnull,
         alarm_mode="transition",
