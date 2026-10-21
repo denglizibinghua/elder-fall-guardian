@@ -1,69 +1,85 @@
-import RPi.GPIO as GPIO
-import smbus2 as smbus
-import time
-import math
-import subprocess
-import requests
+"""树莓派老人看护主程序（运行在 /home/admin/food_project，由 food_project.service 托管）。
+
+职责：
+  1. 启动 4 个传感器驻留线程（MPU6050+按键 / LD2410 存在 / LD2450 轨迹 / MAX30102 心率血氧）
+  2. 每 0.5s 原子写 status.json，供同目录 app.py（:8080）读取
+  3. 每 10s 往本地 mosquitto 推一份 status 快照（边缘总线）
+  4. 跌倒判定交给 fall_fusion.FallDetector；报警先落 alarms.jsonl 再异步拍照
+
+已移除（2026-10-20 清理）：学长旧后端那套 HTTP 上报全部删除。原来 5 个 URL 常量指向
+黑洞端口 127.0.0.1:9，每 5 秒发一次注定 connection-refused 的请求，纯属死代码。
+拍照现在是纯本地存盘，不再尝试上传。
+"""
+
 import os
 import json
+import math
+import time
 import threading
+import subprocess
+from datetime import datetime, timezone
+
+import RPi.GPIO as GPIO
+import smbus2 as smbus
 import board
 import adafruit_dht
-import serial  
-from datetime import datetime, timezone
+import serial
+
 import max30102
 import hrcalc
-# --- ????+?? (2026.09.26, ????????) ---
+
+# --- 跌倒融合算法（导入失败时主循环仍可跑，只是不报警）---
 try:
     import fall_fusion
     _FUSION_OK = True
 except Exception as _e:
     print(f"fusion import skipped: {_e}")
     _FUSION_OK = False
-_STATUS_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "status.json")
-_ALARM_JSONL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alarms.jsonl")
-# MQTT edge bus (local broker only, never blocks main loop)
+
+# --- MQTT 边缘总线（只连本机 broker，绝不阻塞主循环）---
+# 预留对外集成接口：本机 mosquitto 只监听 127.0.0.1:1883，当前无订阅者，
+# 消息发进黑洞；将来接 Home Assistant / 手机 App 时开 listener 到 0.0.0.0 即可。
 try:
     import paho.mqtt.client as _mqttlib
+    # paho >= 2.0 要求显式声明回调 API 版本，否则每次建 Client 都打
+    # "DeprecationWarning: Callback API version 1 is deprecated"。
+    # 本文件不注册任何回调（只用 connect_async/publish），故改 VERSION2 零影响；
+    # 但将来若加 on_connect，签名得用新版的 (client, userdata, flags, reason_code, properties)。
+    # paho 1.x 没有 CallbackAPIVersion，取不到就退回无参构造。
+    _MQTT_CB = getattr(_mqttlib, "CallbackAPIVersion", None)
     _MQTT_OK = True
 except Exception as _e:
     print(f"mqtt import skipped: {_e}")
     _MQTT_OK = False
+    _MQTT_CB = None
+
 _MQTT_TOPICS = {"alarm": "elder/fall/alarm", "button": "elder/button", "status": "elder/status"}
 
-# --- Configuration ---
-# 学长旧后端已死：指向本机黑洞端口，legacy POST 瞬间 connection-refused，
-# 不再让每个请求白耗 2s 超时拖死主循环（2026.10.14，原因见踩坑记录）
-BACKEND_BASE_URL = "http://127.0.0.1:9"
-UPLOAD_URL = f"{BACKEND_BASE_URL}/api/upload"
-STEPS_API_URL = f"{BACKEND_BASE_URL}/api/health/steps"
-HEART_RATE_API_URL = f"{BACKEND_BASE_URL}/api/health/heart-rate"
-TEMP_HUMIDITY_API_URL = f"{BACKEND_BASE_URL}/api/health/temperature_humidity"
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_STATUS_JSON = os.path.join(_BASE_DIR, "status.json")
+_ALARM_JSONL = os.path.join(_BASE_DIR, "alarms.jsonl")
 
-# --- 新增配置 ---
-PRESENCE_API_URL = f"{BACKEND_BASE_URL}/api/presence"
-LOCATION_API_URL = f"{BACKEND_BASE_URL}/api/location"
-FALL_API_URL = f"{BACKEND_BASE_URL}/api/fall_detection"
-FALL_SPEED_THRESHOLD = 10**9  # 学长旧速度分支已停用（原100.0）：报警统一走融合 FallDetector，残留分支永不触发(2026.10.13)
-
-USER_ID = 1  
-DEVICE_ID = 'device_0001'
-TEMP_HUM_UPLOAD_INTERVAL = 60  
-
-# --- GPIO & Hardware Config (不修改原有引脚) ---
-BUTTON_PIN = 17
+# --- 硬件引脚配置 ---
+BUTTON_PIN = 17          # 求助按键（PUD_UP：空闲 LOW / 按下 HIGH）
+LD2410_OUT_PIN = 6       # 存在感应雷达的 OUT 引脚
 MPU6050_ADDR = 0x68
 PWR_MGMT_1 = 0x6B
 ACCEL_XOUT_H = 0x3B
 
-LD2410_OUT_PIN = 6  # 新增
+# --- 采样与上传节奏 ---
+STEP_THRESHOLD = 25000       # 加速度模长阈值（MPU6050 ±2g，静止 1g ≈ 16384 LSB）
+STEP_DEBOUNCE_S = 0.3        # 两步之间最小间隔
+DHT_INTERVAL_S = 2.0         # DHT11 采样率上限
+STATUS_INTERVAL_S = 0.5      # status.json 写入周期（曲线/前端轮询分辨率）
+MQTT_INTERVAL_S = 10.0       # MQTT status 快照周期
+PHOTO_TIMEOUT_MS = "500"     # rpicam-jpeg 曝光时长
 
-# --- Shared State (Thread Safe) ---
+# --- 共享状态（线程安全）---
 class SharedState:
     def __init__(self):
         self.steps = 0
         self.bpm = 0
-        self.spo2 = 0 # 新增：血氧数据
+        self.spo2 = 0
         self.take_photo_flag = False
         self.temperature = None
         self.humidity = None
@@ -71,56 +87,53 @@ class SharedState:
         self.ax = 0
         self.ay = 0
         self.az = 0
-        self.accel_mag = 0
-        self.button_state = "??"
+        self.button_state = "UNKNOWN"
         self.button_alarm_flag = False
-        
-        # 新增
-        self.presence_state = False  
-        self.radar_targets = []      
-        
+        self.presence_state = False
+        self.radar_targets = []
         self.lock = threading.Lock()
+
 
 state = SharedState()
 
-# --- Sensor Helper Functions ---
+
+# --- MPU6050 辅助函数 ---
 def mpu6050_init(bus):
     try:
         bus.write_byte_data(MPU6050_ADDR, PWR_MGMT_1, 0)
     except OSError:
         pass
 
+
 def read_raw_data(bus, addr):
     try:
         high = bus.read_byte_data(MPU6050_ADDR, addr)
-        low = bus.read_byte_data(MPU6050_ADDR, addr+1)
-        value = ((high << 8) | low)
-        if value > 32768:
-            value = value - 65536
-        return value
+        low = bus.read_byte_data(MPU6050_ADDR, addr + 1)
+        value = (high << 8) | low
+        return value - 65536 if value > 32768 else value
     except OSError:
         return 0
 
-# --- 新增：LD2410 (存在数据) 驻留线程 ---
+
+# --- LD2410 存在感应驻留线程 ---
 def ld2410_worker():
     print("LD2410 Presence thread started...")
     GPIO.setmode(GPIO.BCM)
     GPIO.setup(LD2410_OUT_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
-    
+
     try:
-        ser = serial.Serial('/dev/ttyAMA4', 256000, timeout=0.1)  # 刚才配置接线的 UART4
+        ser = serial.Serial('/dev/ttyAMA4', 256000, timeout=0.1)
     except Exception as e:
         print(f"LD2410 UART4 Init Error: {e}")
         ser = None
-        
+
     buffer = b""
     data_state = 0
     while True:
         try:
-            # 1. 优先使用 GPIO 6 硬件引脚的高低电平快速判断雷达存在状态
+            # 优先用 GPIO6 硬件电平快速判断，串口解析仅作兜底
             out_high = (GPIO.input(LD2410_OUT_PIN) == GPIO.HIGH)
-            
-            # 2. 串口解析后备状态兜底
+
             if ser and ser.in_waiting:
                 buffer += ser.read(ser.in_waiting)
                 while len(buffer) >= 23:
@@ -131,28 +144,29 @@ def ld2410_worker():
                     buffer = buffer[head:]
                     if len(buffer) >= 23:
                         if buffer[19] == 0xF8 and buffer[20] == 0xF7:
-                            data_state = buffer[8] 
+                            data_state = buffer[8]
                             buffer = buffer[23:]
                         else:
                             buffer = buffer[1:]
                     else:
                         break
-                        
+
             with state.lock:
                 state.presence_state = out_high or (data_state != 0)
-        except Exception as e:
+        except Exception:
             pass
         time.sleep(0.05)
 
-# --- 新增：LD2450 (轨迹与跌倒数据) 驻留线程 ---
+
+# --- LD2450 轨迹雷达驻留线程 ---
 def ld2450_worker():
     print("LD2450 Radar thread started...")
     try:
-        ser = serial.Serial('/dev/ttyAMA2', 256000, timeout=0.1)  # 刚才配置的接线 UART2
+        ser = serial.Serial('/dev/ttyAMA2', 256000, timeout=0.1)
     except Exception as e:
         print(f"LD2450 UART2 Init Error: {e}")
         ser = None
-        
+
     def calc_val(lb, hb):
         v = lb + (hb * 256)
         return float(v - 32768) if hb >= 128 else float(0 - v)
@@ -172,38 +186,36 @@ def ld2450_worker():
                         if buffer[28] == 0x55 and buffer[29] == 0xCC:
                             frame = buffer[:30]
                             buffer = buffer[30:]
-                            
+
                             targets = []
                             offset = 4
                             for _ in range(3):
-                                x = calc_val(frame[offset], frame[offset+1])
-                                y = calc_val(frame[offset+2], frame[offset+3])
-                                speed = calc_val(frame[offset+4], frame[offset+5])
-                                dist = math.sqrt(x*x + y*y) / 1000.0
+                                x = calc_val(frame[offset], frame[offset + 1])
+                                y = calc_val(frame[offset + 2], frame[offset + 3])
+                                speed = calc_val(frame[offset + 4], frame[offset + 5])
+                                dist = math.sqrt(x * x + y * y) / 1000.0
                                 targets.append({'dist': dist, 'x': x, 'y': y, 'speed': speed})
                                 offset += 8
-                                
+
                             with state.lock:
                                 state.radar_targets = targets
                         else:
                             buffer = buffer[1:]
                     else:
                         break
-        except Exception as e:
+        except Exception:
             pass
         time.sleep(0.05)
 
 
-# --- 新增：MAX30102 (心率血氧) 驻留线程 ---
+# --- MAX30102 心率血氧驻留线程 ---
 def max30102_worker():
     print("MAX30102 Heart Rate/SpO2 thread started...")
-    
-    # 强制让所有线程统一使用 BCM 编号，防止冲突
+
     GPIO.setmode(GPIO.BCM)
-    
+
     try:
-        # MAX30102 连接在新增的 I2C 总线 4 (GPIO 23 & 24)
-        # 注意: 这里的 gpio_pin=4 指的是 BCM GPIO 4 (如果是物理引脚则是7)
+        # MAX30102 挂在软件 I2C 总线 4（GPIO23/24），中断脚 BCM GPIO4
         m = max30102.MAX30102(channel=4, gpio_pin=4)
     except Exception as e:
         print(f"I2C Init Error (MAX30102): {e}")
@@ -211,7 +223,6 @@ def max30102_worker():
 
     while True:
         try:
-            # 获取数据，这会阻塞直到收集满所需样本
             red, ir = m.read_sequential()
             if red and ir:
                 hr, hr_valid, spo2, spo2_valid = hrcalc.calc_hr_and_spo2(ir, red)
@@ -219,16 +230,24 @@ def max30102_worker():
                     with state.lock:
                         state.bpm = hr
                         state.spo2 = spo2
-        except OSError as e:
+        except TimeoutError as e:
+            # 手指未放好 / 传感器脱落：等待期间不再空转烧 CPU
+            print(f"MAX30102 timeout: {e}")
+            time.sleep(1.0)
+        except OSError:
             time.sleep(0.5)
-            try: m.reset()
-            except: pass
-        except Exception as e:
+            try:
+                m.reset()
+            except Exception:
+                pass
+        except Exception:
             time.sleep(0.5)
-# --- Sensor Thread Function ---
+
+
+# --- 按键 + MPU6050 + DHT11 驻留线程 ---
 def sensor_loop():
     print("Sensor thread started...")
-    
+
     GPIO.setmode(GPIO.BCM)
     GPIO.setup(BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
@@ -240,12 +259,9 @@ def sensor_loop():
         bus = None
 
     local_step_count = 0
-    last_mag = 0
-    step_threshold = 25000
     last_step_time = 0
-    
     last_btn_state = GPIO.LOW
-    
+
     try:
         dht_device = adafruit_dht.DHT11(board.D5)
     except Exception as e:
@@ -253,40 +269,39 @@ def sensor_loop():
         dht_device = None
 
     last_dht_read_time = 0
-    
+
     while True:
         current_time = time.time()
-        
-        # 1. READ BUTTON 
+
+        # 1. 按键：上升沿触发求助报警 + 拍照
         btn_raw = GPIO.input(BUTTON_PIN)
         if btn_raw == GPIO.HIGH and last_btn_state == GPIO.LOW:
             print("Button Pressed - Requesting Photo")
             with state.lock:
                 state.take_photo_flag = True
                 state.button_alarm_flag = True
-            time.sleep(0.5) 
+            time.sleep(0.5)
         last_btn_state = btn_raw
         with state.lock:
             state.button_state = "RELEASED" if btn_raw == GPIO.LOW else "PRESSED"
 
-        # 2. READ STEPS
+        # 2. MPU6050 计步
         if bus:
             acc_x = read_raw_data(bus, ACCEL_XOUT_H)
             acc_y = read_raw_data(bus, ACCEL_XOUT_H + 2)
             acc_z = read_raw_data(bus, ACCEL_XOUT_H + 4)
-            
-            curr_mag = math.sqrt(acc_x**2 + acc_y**2 + acc_z**2)
+
+            curr_mag = math.sqrt(acc_x ** 2 + acc_y ** 2 + acc_z ** 2)
             with state.lock:
                 state.ax = acc_x
                 state.ay = acc_y
                 state.az = acc_z
-                state.accel_mag = curr_mag
-            if curr_mag > step_threshold and (current_time - last_step_time) > 0.3:
+            if curr_mag > STEP_THRESHOLD and (current_time - last_step_time) > STEP_DEBOUNCE_S:
                 local_step_count += 1
                 last_step_time = current_time
 
-        # 4. READ DHT11 (every ~2s)
-        if dht_device and (current_time - last_dht_read_time) >= 2.0:
+        # 3. DHT11 温湿度（每 ~2s）
+        if dht_device and (current_time - last_dht_read_time) >= DHT_INTERVAL_S:
             try:
                 temp = dht_device.temperature
                 hum = dht_device.humidity
@@ -305,13 +320,15 @@ def sensor_loop():
 
         with state.lock:
             state.steps = local_step_count
-            
-        time.sleep(0.01)
 
-# --- Main Logic Functions ---
+        time.sleep(0.02)
+
+
+# --- 拍照（纯本地存盘，不再上传任何后端）---
 def take_photo(filename):
     print(f"Taking photo: {filename}")
-    cmd = ["rpicam-jpeg", "-o", filename, "-t", "500", "--width", "1920", "--height", "1080"]
+    cmd = ["rpicam-jpeg", "-o", filename, "-t", PHOTO_TIMEOUT_MS,
+           "--width", "1920", "--height", "1080"]
     try:
         subprocess.run(cmd, check=True)
         return True
@@ -319,206 +336,84 @@ def take_photo(filename):
         print("Camera Error (or not found)")
         return False
 
-def process_photo_task():
+
+def capture_photo_task():
+    """后台线程拍照。存到项目目录，失败只打印不抛。"""
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    filename = f"{timestamp}_food.jpg"
-    
-    if take_photo(filename):
-        print("Uploading photo...")
-        if not os.path.exists(filename): return
-        
-        try:
-            with open(filename, 'rb') as f:
-                files = {'file': f}
-                data = {'device_id': DEVICE_ID, 'user_id': USER_ID}
-                res = requests.post(UPLOAD_URL, files=files, data=data, timeout=2)
-                if res.status_code == 200:
-                    print(f"Analysis: {res.text}")
-                else:
-                    print(f"Upload Failed: {res.status_code}")
-        except Exception as e:
-            print(f"Upload Error: {e}")
+    filename = os.path.join(_BASE_DIR, f"{timestamp}_food.jpg")
+    take_photo(filename)
 
-def process_sensor_upload():
-    bpm_val = 0
-    spo2_val = 0
-    steps_val = 0
-    with state.lock:
-        bpm_val = int(state.bpm)
-        spo2_val = float(state.spo2)
-        steps_val = state.steps
-    try:
-        payload = {'count': steps_val, 'user_id': USER_ID, 'device_id': DEVICE_ID}
-        requests.post(STEPS_API_URL, json=payload, timeout=2)
-    except Exception as e:
-        print(f"Step Upload Warning: {e}")
-    try:
-        # 修改上传负载，对接最新的心率和血氧接口格式
-        payload = {
-            'bpm': bpm_val, 
-            'blood_oxygen': round(spo2_val, 1), 
-            'device_id': DEVICE_ID
-        }
-        res = requests.post(HEART_RATE_API_URL, json=payload, timeout=2)
-        if res.status_code == 200 or res.status_code == 201:
-            print(f"[Upload OK] 心率: {bpm_val}, 血氧: {payload['blood_oxygen']}")
-        else:
-            print(f"[Upload Failed] 后端返回错误: {res.text}")
-    except Exception as e:
-        print(f"HR/SPO2 Upload Warning: {e}")
-
-def process_temp_humidity_upload():
-    with state.lock:
-        temp = state.temperature
-        hum = state.humidity
-        rec = state.temp_recorded_at
-
-    if temp is None or hum is None: return
-    if not rec:
-        rec = datetime.now(timezone.utc).isoformat()
-
-    payload = {
-        'device_id': DEVICE_ID, 'temperature': f"{temp:.1f}", 'humidity': str(hum), 'recorded_at': rec
-    }
-    try:
-        requests.post(TEMP_HUMIDITY_API_URL, json=payload, timeout=3)
-    except Exception as e:
-        pass
 
 if __name__ == "__main__":
-    t = threading.Thread(target=sensor_loop, daemon=True)
-    t.start()
-    
-    # 启动 MAX30102 线程
-    t_max = threading.Thread(target=max30102_worker, daemon=True)
-    t_max.start()
-    
-    # 启动新增雷达线程
-    t_2410 = threading.Thread(target=ld2410_worker, daemon=True)
-    t_2410.start()
-    t_2450 = threading.Thread(target=ld2450_worker, daemon=True)
-    t_2450.start()
-    
-    print("System Running. Press Button to capture. Auto-upload sensors every 5s.")
-    
-    last_upload_time = time.time()
-    last_temp_upload_time = time.time()
-    
-    # --- 新增的计时器与持久状态 ---
-    last_presence_time = 0
-    last_location_time = 0
-    last_fall_time = 0
-    last_presence_state = False
+    threading.Thread(target=sensor_loop, daemon=True).start()
+    threading.Thread(target=max30102_worker, daemon=True).start()
+    threading.Thread(target=ld2410_worker, daemon=True).start()
+    threading.Thread(target=ld2450_worker, daemon=True).start()
+
+    print("System Running. Press Button to capture. Fall detection via fusion.")
+
     _rules = fall_fusion.load_rules() if _FUSION_OK else {}
     _detector = fall_fusion.FallDetector(alarm_file=_ALARM_JSONL, rules=_rules) if _FUSION_OK else None
-    _last_status_time = 0
-    _last_mqtt_time = 0
+    if _detector is None:
+        print("fusion disabled")
+    else:
+        print("fusion enabled ->", _ALARM_JSONL)
+
+    _last_status_time = 0.0
+    _last_mqtt_time = 0.0
     _mqttc = None
     if _MQTT_OK:
         try:
-            _mqttc = _mqttlib.Client()
+            _mqttc = _mqttlib.Client(_MQTT_CB.VERSION2) if _MQTT_CB else _mqttlib.Client()
             _mqttc.connect_async("127.0.0.1", 1883, 60)
             _mqttc.loop_start()
             print("mqtt enabled -> 127.0.0.1:1883")
         except Exception as _e:
             print(f"mqtt connect skipped: {_e}")
             _mqttc = None
-    if _detector is None:
-        print("fusion disabled")
-    else:
-        print("fusion enabled ->", _ALARM_JSONL)
-    
+
     try:
         while True:
             current_time = time.time()
-            
-            # --- 1. 原有照片逻辑 ---
-            pending_photo = False
-            with state.lock:
-                if state.take_photo_flag:
-                    pending_photo = True
-                    state.take_photo_flag = False
+
+            # --- 1. 求助按键：立即报警（不进 cooldown，报警优先）---
             _btn = False
             with state.lock:
                 if state.button_alarm_flag:
-                    _btn = True
                     state.button_alarm_flag = False
+                    _btn = True
+
+            _bev = None
             if _btn:
-                _bev = None
+                _detail = "button GPIO17 \u6c42\u52a9\u6309\u952e"
                 try:
                     if _detector is not None:
-                        _bev = _detector._emit_fall("button GPIO17 \u6c42\u52a9\u6309\u952e")
-                    else:
-                        _bev = {"time": datetime.now(timezone.utc).isoformat(), "type": "FALL", "detail": "button GPIO17 \u6c42\u52a9\u6309\u952e"}
+                        _bev = _detector._emit_fall(_detail)
+                    if _bev is None:
+                        _bev = {"time": datetime.now(timezone.utc).isoformat(),
+                                "type": "FALL", "detail": _detail}
                         with open(_ALARM_JSONL, "a", encoding="utf-8") as _fh:
                             _fh.write(json.dumps(_bev, ensure_ascii=False) + "\n")
                 except Exception as _e:
                     print(f"button alarm warn: {_e}")
-                if _bev:
-                    print(f"!!! BUTTON ALARM !!! {_bev.get('detail','')}")
-            if pending_photo:
-                threading.Thread(target=process_photo_task, daemon=True).start()
+                    _bev = None
+            if _bev is not None:
+                print(f"!!! BUTTON ALARM !!! {_bev.get('detail','')}")
                 if _mqttc is not None:
                     try:
                         _mqttc.publish(_MQTT_TOPICS["button"], json.dumps(_bev, ensure_ascii=False))
                     except Exception:
                         pass
-            
-            # --- 2. 原有 5 秒心率步数 ---
-            if current_time - last_upload_time >= 5.0:
-                process_sensor_upload()
-                last_upload_time = current_time
 
-            # --- 3. 原有 60 秒温湿度 ---
-            if current_time - last_temp_upload_time >= TEMP_HUM_UPLOAD_INTERVAL:
-                process_temp_humidity_upload()
-                last_temp_upload_time = current_time
-                
-            # ================= 新增传感器循环上报区域 =================
+            # --- 2. 拍照请求（按键或跌倒后由 fall_fusion 置位）---
             with state.lock:
-                curr_presence = state.presence_state
-                curr_targets = list(state.radar_targets) 
+                pending_photo = state.take_photo_flag
+                if pending_photo:
+                    state.take_photo_flag = False
+            if pending_photo:
+                threading.Thread(target=capture_photo_task, daemon=True).start()
 
-            # 4. 在场检测：状态改变或每5秒心跳发一次
-            if (curr_presence != last_presence_state) or (current_time - last_presence_time >= 5.0):
-                try:
-                    payload = {"is_present": curr_presence, "location": "Living Room", "device_id": DEVICE_ID}
-                    requests.post(PRESENCE_API_URL, json=payload, timeout=2)
-                    last_presence_state = curr_presence
-                    last_presence_time = current_time
-                except Exception: pass
-
-            valid_targets = [t for t in curr_targets if t['dist'] > 0]
-            
-            # 5. 雷达轨迹定点上传：限制每 5 秒推送一次
-            if valid_targets and (current_time - last_location_time >= 5.0):
-                try:
-                    t = valid_targets[0] 
-                    payload = {"location_x": t['x'], "location_y": t['y'], "speed": t['speed'], "device_id": DEVICE_ID}
-                    requests.post(LOCATION_API_URL, json=payload, timeout=2)
-                    last_location_time = current_time
-                except Exception: pass
-            
-            # 6. 跌倒判定保护：冷却期 10 秒以上
-            if current_time - last_fall_time >= 10.0:
-                for t in valid_targets:
-                    if t['speed'] > FALL_SPEED_THRESHOLD:
-                        print(f"!!! FALL DETECTED !!! Speed: {t['speed']} cm/s")
-                        try:
-                            payload = {
-                                "alert_type": "FALL", 
-                                "message": "检测到跌倒 (速度异常)", 
-                                "location_x": t['x'], 
-                                "location_y": t['y'], 
-                                "device_id": DEVICE_ID
-                            }
-                            requests.post(FALL_API_URL, json=payload, timeout=2)
-                            last_fall_time = current_time
-                        except Exception as e: 
-                            pass
-                        break
-                        
-            # --- ?????? + ???? (??,????) ---
+            # --- 3. 跌倒融合判定 + status.json + MQTT 快照 ---
             try:
                 with state.lock:
                     _ax, _ay, _az = state.ax, state.ay, state.az
@@ -528,6 +423,7 @@ if __name__ == "__main__":
                                temp_recorded_at=state.temp_recorded_at,
                                presence_state=state.presence_state,
                                radar_targets=list(state.radar_targets))
+
                 if _detector is not None:
                     _ev = _detector.update(_ax, _ay, _az, _st["radar_targets"])
                     if _ev and _ev.get("type") == "FALL":
@@ -539,16 +435,19 @@ if __name__ == "__main__":
                                 pass
                         with state.lock:
                             state.take_photo_flag = True
-                if current_time - _last_status_time >= 0.5:  # 0.5s: 曲线/轮询分辨率，2s 太钝(2026.10.14)
-                    _payload = dict(_st, waiting=False, button=_bw, mqtt=(_mqttc is not None),
-                                    take_photo_flag=False,
-                                    updated_at=datetime.now(timezone.utc).isoformat())
+
+                _payload = dict(_st, waiting=False, button=_bw, mqtt=(_mqttc is not None),
+                                take_photo_flag=False,
+                                updated_at=datetime.now(timezone.utc).isoformat())
+
+                if current_time - _last_status_time >= STATUS_INTERVAL_S:
                     _tmp = _STATUS_JSON + ".tmp"
                     with open(_tmp, "w", encoding="utf-8") as _fh:
                         json.dump(_payload, _fh, ensure_ascii=False)
                     os.replace(_tmp, _STATUS_JSON)
                     _last_status_time = current_time
-                if _mqttc is not None and (current_time - _last_mqtt_time >= 10.0):
+
+                if _mqttc is not None and (current_time - _last_mqtt_time >= MQTT_INTERVAL_S):
                     try:
                         _mqttc.publish(_MQTT_TOPICS["status"], json.dumps(_payload, ensure_ascii=False))
                     except Exception:
@@ -556,8 +455,9 @@ if __name__ == "__main__":
                     _last_mqtt_time = current_time
             except Exception as _e:
                 print(f"fusion/status warn: {_e}")
+
             time.sleep(0.1)
-            
+
     except KeyboardInterrupt:
         print("Stopping...")
         GPIO.cleanup()

@@ -1,6 +1,7 @@
 # 基于树莓派+毫米波雷达的老人跌倒监护原型（边缘计算）
 
-> 状态：L1 闭环 + 判据校准完成（2026.10.14），transition 判据已上线。
+> 状态：L1 闭环 + 判据校准完成（2026.10.14）；**2026-10-21 板端快照已同步到 `board-snapshot-20261021` 分支**
+> （删净旧后端 HTTP 死代码、看板 6-tab 改版、现场阈值 0.5m/s，差异明细见 `docs/板端快照_20261021.md`）。
 > 一句话：LD2450 看人在哪、按"活动→速度骤停→持续静止"的边缘特征判摔；DHT/MPU/MAX30102 采环境体征，大按键一键求助；判定与落盘全部在设备端，断网报警能力零损失，局域网移动看板（PWA）。
 
 ## 1. 系统判据（核心，2026.10.14 版）
@@ -16,12 +17,15 @@
 
 误报治理实测（板载 alarms.jsonl 真值）：改造前 8 分钟 14 条误报 → 治理后日常使用接近于零。
 
-## 2. 当前参数（rules.json，可热改）
+## 2. 当前参数（rules.json，可热改；下列为 2026-10-21 板端生效值）
 
 ```json
-{"alarm_mode":"transition","active_speed_threshold":100.0,"alarm_cooldown":30.0,"fusion_window":10.0,
- "spike_threshold":25000,"still_speed_threshold":100.0,"stillness_duration":3.0,"transition_window":3.0}
+{"alarm_mode":"transition","active_speed_threshold":50.0,"alarm_cooldown":30.0,"fusion_window":10.0,
+ "spike_threshold":25000,"still_speed_threshold":50.0,"stillness_duration":3.0,"transition_window":3.0}
 ```
+
+10-14 的基线是 100/100（1m/s），10-20 演示前在板端现场下调到 **50/50（0.5m/s）**：慢走也能被判为活动，
+代价是坐下/蹲起更容易误报。看板「关于」页通过 `GET /api/rules` 直接展示这些值，改 JSON 即生效。
 
 保留 **fusion 模式**（MPU 冲击尖峰 + 雷达静止 融合）为可一键切回的备选判据；50Hz 板载实测证明该安装位下人体冲击到板仅 ±0.09g、与日常振动不可分，故暂以 transition 为主判据（诚实边界，见 `docs/架构说明.md`）。
 
@@ -33,16 +37,18 @@ LD2450(UART2, 坐标/径向速度 20Hz) + MPU6050(I2C, 计步保留)
   → FALL: alarms.jsonl 落盘 + 摄像头抓拍 + 看板横幅（"已知晓"闩锁）
 DHT11(GPIO5 温湿度) + MAX30102(I2C 心率血氧) + 大按键(GPIO17 立即报警)
   → main.py 每 0.5s 原子写 status.json → app.py(:8080) 浏览器 0.6s 轮询
+  → main.py 每 10s 往本机 mosquitto(127.0.0.1:1883) 推 elder/status 心跳
 ```
 
-- 主程序 `main.py`（板端权威版本）：双线程 + 主循环 + 判据挂接 + 状态快照
+- 主程序 `main.py`（板端权威版本）：4 个采集线程（MPU+按键+DHT / MAX30102 / LD2410 / LD2450）+ 主循环 + 判据挂接 + 状态快照；旧后端的 HTTP 上报已在 10-20 清理时整段删除，拍照只存本地
 - 判据模块 `fall_fusion.py`：纯逻辑、零硬件依赖、可离线自测（`python fall_fusion.py`，9/9 用例）
-- 看板 `webapp/app.py`：纯标准库 HTTP + 内嵌移动端页面 + PWA manifest/icon + CSV 报警导出
-- 采样工具 `tools/`：50Hz MPU 冲击谱、90s 位移速度谱、径向速度排查——判据校准的实测证据链
+- 看板 `webapp/app.py`：纯标准库 HTTP + 6-tab 移动端页面（总览/轨迹/报警/设备/相册/关于）+ PWA manifest/icon + CSV 报警导出 + 判定参数页
+- 采样工具 `tools/`：50Hz MPU 冲击谱、90s 位移速度谱、径向速度排查 + 六个硬件调试脚本（与 main 同跑会 GPIO.cleanup 杀掉采集，禁用）
+- 部署件 `deploy/`：两个 systemd 单元 + 看板启停脚本（板端绝对路径，换机需改）
 
 ## 4. Web 演示（四步）
 
-浏览器开 `http://192.168.137.142:8080`（同热点任意设备）：
+浏览器开 `http://<派IP>:8080`（同热点任意设备；IP 由热点 DHCP 分配，10-21 实测为 `192.168.137.139`，可用 `arp -a | findstr 2c-cf-67` 按 MAC 找）：
 
 1. **存在**：走过→"有人"+坐标动，挥手 0.4m 跟手
 2. **跌倒模拟**：快走两步→骤停躺平 → ~4s 内横幅报警 + 落盘 + 自动抓拍
@@ -51,10 +57,11 @@ DHT11(GPIO5 温湿度) + MAX30102(I2C 心率血氧) + 大按键(GPIO17 立即报
 
 ## 5. 网络与部署
 
-- 笔记本 Win 热点（ICS），SSID `22333`，派 IP `192.168.137.142`，SSH 密钥登录（`BatchMode` 支持）
-- 双服务自启：`food_project.service`（主程序）+ `webapp.service`（看板）
-- 看板/Pi 文件清单见各文件头注释；代码风格纯标准库（除 adafruit_dht / smbus2 / RPi.GPIO 外无第三方依赖）
-- MQTT：主程序内置报警/状态双主题发布代码，接入 Broker 即启用（多终端扩展预留，未启用）
+- 笔记本 Win 热点（ICS），SSID `22333`，派 IP 走 DHCP（10-21 为 `192.168.137.139`），SSH 密钥登录（`BatchMode` 支持）
+- 双服务自启：`food_project.service`（主程序）+ `food-web.service`（看板），单元文件见 `deploy/`
+- 看板/Pi 文件清单见各文件头注释；代码风格纯标准库（除 adafruit_dht / smbus2 / RPi.GPIO / paho-mqtt 外无第三方依赖）
+- MQTT：主程序已连本机 `mosquitto`（`127.0.0.1:1883`），发布 `elder/fall/alarm` / `elder/button` / `elder/status`；
+  broker 只监听回环，属于边缘总线预留，接 Home Assistant 或手机 App 时再开 listener 到局域网
 
 ## 6. 踩坑记录（血泪浓缩，答辩素材）
 
@@ -62,7 +69,8 @@ DHT11(GPIO5 温湿度) + MAX30102(I2C 心率血氧) + 大按键(GPIO17 立即报
 - SSH Permission denied ≠ 密码错，是 CPU 满载限流，晾 60s+ 再试
 - 三脚有源按键 VCC 必须接 3V3（禁 5V），逻辑反转已在代码适配
 - 面包板同排 5 孔内部直通，GPIO 与 GND 别落同排
-- 派端脚本禁止 BOM（首行必死）；多路径上传通道已失效→指向本机黑洞端口防 2s 阻塞拖慢主循环
+- 派端脚本禁止 BOM（首行必死）；旧代码曾把失效上报地址指向本机黑洞端口（`127.0.0.1:9`）来防 2s 阻塞——
+  10-20 已彻底删掉这套 HTTP 上报与拍照上传，别再按老路子加回来
 - LD2450 槽位会被反射体瞬移骗（多目标换位=幻影运动），必须有身份门控
 - 板载 MPU 看不见人体（±0.09g@50Hz 实测）——安装位决定传感器能力，量力选判据
 
