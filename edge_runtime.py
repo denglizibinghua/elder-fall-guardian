@@ -418,7 +418,7 @@ def run() -> None:
                 )
                 write_status(payload)
                 last_status = now
-            if now - last_state >= 10.0:
+            if now - last_state >= 0.5:
                 bus.publish_json("state", payload)
                 last_state = now
             if now - last_heartbeat >= 10.0:
