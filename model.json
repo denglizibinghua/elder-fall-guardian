@@ -1,0 +1,33 @@
+{
+  "model_version": "smart-v1",
+  "type": "logistic",
+  "threshold": 0.60,
+  "bias": -2.25,
+  "features": [
+    "speed_peak_3s",
+    "drop_slope",
+    "still_duration",
+    "still_variance",
+    "track_quality",
+    "presence",
+    "imu_delta"
+  ],
+  "weights": {
+    "speed_peak_3s": 1.05,
+    "drop_slope": 0.85,
+    "still_duration": 0.95,
+    "still_variance": -0.65,
+    "track_quality": 0.75,
+    "presence": 0.35,
+    "imu_delta": 0.12
+  },
+  "normalization": {
+    "speed_peak_3s": 150.0,
+    "drop_slope": 1000.0,
+    "still_duration": 5.0,
+    "still_variance": 2500.0,
+    "track_quality": 1.0,
+    "presence": 1.0,
+    "imu_delta": 16000.0
+  }
+}

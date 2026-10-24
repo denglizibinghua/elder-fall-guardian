@@ -10,6 +10,8 @@ pip-log.txt
 status.json
 alarms.jsonl
 *.jsonl
+*.log
+*.pid
 outputs/
 *.wav
 *.mp3

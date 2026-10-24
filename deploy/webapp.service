@@ -1,0 +1,14 @@
+[Unit]
+Description=elder-monitor webapp :8080
+After=network.target
+
+[Service]
+User=admin
+WorkingDirectory=/home/admin/food_project
+ExecStart=/usr/bin/python3 /home/admin/food_project/app.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

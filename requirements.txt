@@ -7,6 +7,6 @@
 RPi.GPIO
 smbus2
 pyserial
-requests
+paho-mqtt>=2.0,<3
 adafruit-blinka
 adafruit-circuitpython-dht

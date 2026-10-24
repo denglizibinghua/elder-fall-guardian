@@ -39,7 +39,6 @@
   GET /api/status   与 dashboard.py 同形的状态 JSON
   GET /api/alarms   {"alarms": [...最近50条...], "count": N}
   GET /api/devices  {"devices": [...] 或 []}
-  GET /api/rules    {"ok":bool,"items":[{key,label,desc,value}]} 判定参数（rules.json）
   GET /api/export   报警 CSV 导出（text/csv，附件 alarms.csv，表头 time,type,detail）
   GET /api/photos   {"photos": [{name, mtime}...最近20张...], "count": N}
   GET /photo/<name> 单张 *_food.jpg（image/jpeg，basename+.jpg+BASE_DIR 越界校验）
@@ -52,19 +51,100 @@
 """
 
 import glob
+import base64
+import hashlib
 import json
 import os
+import select
 import socket
-from datetime import datetime
+import threading
+import time
+import re
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote
+
+try:
+    from ws import WebSocketHub, accept_key
+except Exception:
+    class WebSocketHub:
+        def __init__(self):
+            self._peers = {}
+            self._lock = threading.Lock()
+
+        def add(self, connection, writer):
+            peer = {"connection": connection, "writer": writer, "lock": threading.Lock(), "closed": False}
+            with self._lock:
+                self._peers[id(peer)] = peer
+            return peer
+
+        def remove(self, peer):
+            peer["closed"] = True
+            with self._lock:
+                self._peers.pop(id(peer), None)
+
+        def broadcast(self, value):
+            payload = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            length = len(payload)
+            if length < 126:
+                frame = b"\x81" + bytes([length]) + payload
+            elif length < 65536:
+                frame = b"\x81\x7e" + length.to_bytes(2, "big") + payload
+            else:
+                frame = b"\x81\x7f" + length.to_bytes(8, "big") + payload
+            with self._lock:
+                peers = list(self._peers.values())
+            for peer in peers:
+                if peer["closed"]:
+                    continue
+                try:
+                    with peer["lock"]:
+                        peer["writer"].write(frame)
+                        peer["writer"].flush()
+                except OSError:
+                    self.remove(peer)
+
+        def count(self):
+            with self._lock:
+                return len(self._peers)
+
+    def accept_key(client_key):
+        raw = (client_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+        return base64.b64encode(hashlib.sha1(raw).digest()).decode("ascii")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATUS_FILE = os.path.join(BASE_DIR, "status.json")
 ALARMS_FILE = os.path.join(BASE_DIR, "alarms.jsonl")
 DEVICES_FILE = os.path.join(BASE_DIR, "devices.json")
-RULES_FILE = os.path.join(BASE_DIR, "rules.json")
+ACK_FILE = os.path.join(BASE_DIR, "acknowledged.jsonl")
 PORT = 8080
+WS_HUB = WebSocketHub()
+ACK_LOCK = threading.Lock()
+
+
+def live_snapshot():
+    return {
+        "type": "snapshot",
+        "status": load_status(),
+        "alarms": load_alarms(50),
+        "nodes": node_payload(),
+    }
+
+
+def _watch_live_files():
+    """Push state changes to browsers without polling from the browser."""
+    last_signature = None
+    while True:
+        try:
+            status_mtime = os.path.getmtime(STATUS_FILE) if os.path.exists(STATUS_FILE) else 0
+            alarm_mtime = os.path.getmtime(ALARMS_FILE) if os.path.exists(ALARMS_FILE) else 0
+            signature = (status_mtime, alarm_mtime)
+            if signature != last_signature:
+                WS_HUB.broadcast(live_snapshot())
+                last_signature = signature
+        except Exception:
+            pass
+        time.sleep(0.35)
 
 
 # ---------------------------------------------------------------- 状态读取
@@ -80,6 +160,13 @@ def _to_int(v):
         return int(v or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _safe_mtime(path):
+    try:
+        return os.path.getmtime(path) if os.path.exists(path) else None
+    except OSError:
+        return None
 
 
 def normalize_button(raw):
@@ -102,7 +189,10 @@ def normalize_button(raw):
 def load_status():
     """读 status.json；缺失/损坏时返回等待占位，不抛异常。"""
     placeholder = {
+        "schema_version": 1,
         "waiting": True,
+        "device_id": None,
+        "seq": 0,
         "presence_state": False,
         "presence_text": "等待树莓派数据",
         "radar_targets": [],
@@ -112,8 +202,17 @@ def load_status():
         "temp_recorded_at": None,
         "bpm": 0,
         "spo2": 0,
+        "bpm_valid": False,
+        "spo2_valid": False,
         "button": "未知",
         "take_photo_flag": False,
+        "detector": {
+            "state": "WAITING",
+            "confidence": 0.0,
+            "model_version": "unknown",
+            "motion_speed_cm_s": 0.0,
+            "evidence": {},
+        },
         "updated_at": None,
     }
     try:
@@ -142,29 +241,119 @@ def load_status():
                 })
             except (TypeError, ValueError):
                 continue
-        presence = bool(raw.get("presence_state", False))
+        presence_sensor = bool(raw.get("presence_state", False))
+        # LD2450 is a useful presence fallback when LD2410 GPIO data lags.
+        presence = presence_sensor or bool(clean_targets)
         btn = raw.get("button", raw.get("button_state", "未知"))
         spo2 = _to_float(raw.get("spo2", 0) or 0)
+        bpm = _to_int(raw.get("bpm", 0))
+        bpm_valid = bool(raw.get("bpm_valid", 30 <= bpm <= 200)) and 30 <= bpm <= 200
+        spo2_valid = bool(raw.get("spo2_valid", spo2 is not None and 70 <= spo2 <= 100))
+        detector = raw.get("detector", {})
+        if not isinstance(detector, dict):
+            detector = {}
+        evidence = detector.get("evidence", {})
+        if not isinstance(evidence, dict):
+            evidence = {}
+        motion_speed = _to_float(
+            detector.get("motion_speed_cm_s", evidence.get("motion_speed_cm_s", 0.0))
+        )
         out = {
+            "schema_version": _to_int(raw.get("schema_version", 1)),
             "waiting": False,
+            "device_id": raw.get("device_id"),
+            "room_id": raw.get("room_id"),
+            "seq": _to_int(raw.get("seq", 0)),
             "presence_state": presence,
+            "presence_sensor": presence_sensor,
             "presence_text": "存在" if presence else "无人",
             "radar_targets": clean_targets,
             "steps": _to_int(raw.get("steps", 0)),
             "temperature": _to_float(raw.get("temperature")),
             "humidity": _to_float(raw.get("humidity")),
             "temp_recorded_at": raw.get("temp_recorded_at"),
-            "bpm": _to_int(raw.get("bpm", 0)),
-            "spo2": 0 if spo2 is None else spo2,
+            "bpm": bpm if bpm_valid else 0,
+            "spo2": spo2 if spo2_valid and spo2 is not None else 0,
+            "bpm_valid": bpm_valid,
+            "spo2_valid": spo2_valid,
             "button": normalize_button(btn),
             "take_photo_flag": bool(raw.get("take_photo_flag", False)),
+            "mqtt": bool(raw.get("mqtt", False)),
+            "outbox_pending": _to_int(raw.get("outbox_pending", 0)),
+            "detector": {
+                "state": str(detector.get("state", "WAITING")),
+                "confidence": _to_float(detector.get("confidence", 0.0)) or 0.0,
+                "model_version": str(detector.get("model_version", "unknown")),
+                "motion_speed_cm_s": max(0.0, motion_speed or 0.0),
+                "evidence": evidence,
+            },
+            "health": raw.get("health", {}),
             "updated_at": raw.get("updated_at"),
         }
-        if "mqtt" in raw and isinstance(raw.get("mqtt"), bool):
-            out["mqtt"] = bool(raw.get("mqtt"))
         return out
     except Exception:
         return placeholder
+
+
+# ---------------------------------------------------------------- 报警与确认记录
+def _clean_control_text(value):
+    """Remove NUL and non-printing control bytes before parsing/exporting data."""
+    if value is None:
+        return ""
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", str(value))
+
+
+def alarm_id(item):
+    if not isinstance(item, dict):
+        return ""
+    return str(
+        item.get("event_id")
+        or item.get("id")
+        or item.get("time")
+        or item.get("timestamp")
+        or item.get("detail")
+        or item.get("message")
+        or ""
+    )
+
+
+def load_acknowledgements():
+    records = {}
+    if not os.path.exists(ACK_FILE):
+        return records
+    try:
+        with open(ACK_FILE, "r", encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                line = _clean_control_text(raw).strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(item, dict) and item.get("event_id"):
+                    records[str(item["event_id"])] = item
+    except OSError:
+        pass
+    return records
+
+
+def acknowledge_alarm(event_id, actor="现场操作员"):
+    event_id = _clean_control_text(event_id).strip()
+    if not event_id:
+        return False
+    record = {
+        "event_id": event_id,
+        "actor": _clean_control_text(actor).strip() or "现场操作员",
+        "acknowledged_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        with ACK_LOCK:
+            with open(ACK_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return True
+    except OSError:
+        return False
 
 
 # ---------------------------------------------------------------- 报警读取
@@ -178,7 +367,7 @@ def load_alarms(limit=50):
         tail = lines[-limit:] if len(lines) > limit else lines
         out = []
         for line in tail:
-            line = line.strip()
+            line = _clean_control_text(line).strip()
             if not line:
                 continue
             try:
@@ -186,25 +375,58 @@ def load_alarms(limit=50):
                 if isinstance(obj, dict):
                     out.append(obj)
                 else:
-                    out.append({"message": line})
+                    out.append({"message": line, "invalid": True})
             except Exception:
-                out.append({"message": line})
+                out.append({"message": line, "invalid": True})
+        acknowledgements = load_acknowledgements()
+        for item in out:
+            event_key = alarm_id(item)
+            ack = acknowledgements.get(event_key)
+            item["acknowledged"] = bool(ack)
+            if ack:
+                item["acknowledged_at"] = ack.get("acknowledged_at")
+                item["acknowledged_by"] = ack.get("actor")
         return out
     except Exception:
         return []
 
 
+def latest_alarm_ts(alarms):
+    """从报警里提取最新时间戳（秒）；解析失败返回 None。"""
+    if not alarms:
+        return None
+    last = alarms[-1]
+    if not isinstance(last, dict):
+        return None
+    for key in ("timestamp", "time", "created_at", "recorded_at", "ts"):
+        v = last.get(key)
+        if v is None:
+            continue
+        try:
+            if isinstance(v, (int, float)):
+                return float(v / 1000.0) if v > 1e12 else float(v)
+            s = str(v)
+            iso = s.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except Exception:
+            continue
+    return None
+
+
 # ---------------------------------------------------------------- CSV 导出
 def _csv_field(v):
     """CSV 字段加引号，内部双引号翻倍（RFC 4180 风格）。"""
-    s = "" if v is None else str(v)
+    s = _clean_control_text(v)
     return '"' + s.replace('"', '""') + '"'
 
 
 def _alarm_cells(it):
     """从单条报警提取 (time, type, detail)，兼容旧字段 message/timestamp。"""
     if not isinstance(it, dict):
-        return ("", "", str(it))
+        return ("", "", _clean_control_text(it))
     t = it.get("time", it.get("timestamp", it.get("created_at", "")))
     ty = it.get("type", it.get("alert_type", ""))
     if it.get("detail") is not None:
@@ -222,7 +444,7 @@ def _alarm_cells(it):
         ty = ""
     if d is None:
         d = ""
-    return (t, ty, d)
+    return (_clean_control_text(t), _clean_control_text(ty), _clean_control_text(d))
 
 
 def build_alarms_csv(alarms):
@@ -232,42 +454,6 @@ def build_alarms_csv(alarms):
         t, ty, d = _alarm_cells(it)
         lines.append(",".join((_csv_field(t), _csv_field(ty), _csv_field(d))))
     return "\r\n".join(lines) + "\r\n"
-
-
-# ---------------------------------------------------------------- 规则读取
-RULE_LABELS = {
-    "alarm_mode": ("判定模式", "transition=速度骤降沿（默认）/ fusion=IMU+静止融合"),
-    "active_speed_threshold": ("活动阈值", "位移速度高于此值视为活动"),
-    "alarm_cooldown": ("报警冷却", "两次报警之间的最小间隔"),
-    "fusion_window": ("融合窗口", "IMU 尖峰后等待静止的时间窗"),
-    "spike_threshold": ("IMU 尖峰阈值", "合加速度突变门限"),
-    "still_speed_threshold": ("静止阈值", "低于此值视为静止"),
-    "stillness_duration": ("静止持续", "静止保持多久才确认"),
-    "transition_window": ("骤降窗口", "活动结束后多久内骤停算跌倒"),
-}
-
-
-def load_rules():
-    """读 rules.json -> {"ok":bool,"values":{k:v},"items":[{key,label,value,desc}]}。"""
-    try:
-        if not os.path.exists(RULES_FILE):
-            return {"ok": False, "items": []}
-        with open(RULES_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        if not isinstance(raw, dict):
-            return {"ok": False, "items": []}
-        items = []
-        for k, v in raw.items():
-            lab, desc = RULE_LABELS.get(k, (k, ""))
-            items.append({
-                "key": k,
-                "label": lab,
-                "desc": desc,
-                "value": v if isinstance(v, (int, float, str, bool)) else json.dumps(v, ensure_ascii=False),
-            })
-        return {"ok": True, "items": items}
-    except Exception:
-        return {"ok": False, "items": []}
 
 
 # ---------------------------------------------------------------- 设备读取
@@ -298,6 +484,43 @@ def load_devices():
         return []
 
 
+def load_nodes():
+    """Expose the local Raspberry Pi as a node for the unified device contract."""
+    status = load_status()
+    updated_at = status.get("updated_at")
+    age_s = None
+    if updated_at:
+        try:
+            dt = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age_s = round(max(0.0, time.time() - dt.timestamp()), 1)
+        except (TypeError, ValueError, OverflowError):
+            age_s = None
+    online = not status.get("waiting") and (age_s is None or age_s <= 5.0)
+    return [{
+        "id": status.get("device_id") or "pi-local",
+        "room_id": status.get("room_id") or "未分配房间",
+        "status": "online" if online else "offline",
+        "age_s": age_s,
+        "last_seen": updated_at,
+        "seq": status.get("seq", 0),
+        "presence_state": status.get("presence_state"),
+        "detector": status.get("detector", {}),
+        "local": True,
+        "health": status.get("health", {}),
+    }]
+
+
+def node_payload():
+    status = load_status()
+    return {
+        "connected": bool(status.get("mqtt", False)),
+        "enabled": bool(status.get("mqtt", False)),
+        "nodes": load_nodes(),
+    }
+
+
 # ---------------------------------------------------------------- 照片读取
 def load_photos(limit=20):
     """扫 BASE_DIR 下 *_food.jpg，按 mtime 倒序取前 limit 个；缺目录/无文件返回 []。"""
@@ -314,12 +537,22 @@ def load_photos(limit=20):
                 items.append({
                     "name": os.path.basename(p),
                     "mtime": datetime.fromtimestamp(mt).isoformat(timespec="seconds"),
+                    "valid": os.path.getsize(p) > 0,
+                    "size": os.path.getsize(p),
                     "_mt": mt,
                 })
             except Exception:
                 continue
         items.sort(key=lambda d: d["_mt"], reverse=True)
-        return [{"name": d["name"], "mtime": d["mtime"]} for d in items[:limit]]
+        return [
+            {
+                "name": d["name"],
+                "mtime": d["mtime"],
+                "valid": d["valid"],
+                "size": d["size"],
+            }
+            for d in items[:limit]
+        ]
     except Exception:
         return []
 
@@ -336,114 +569,81 @@ PAGE = """<!DOCTYPE html>
 <meta name="theme-color" content="#070d1a">
 <title>老人跌倒监护</title>
 <style>
-:root{--bg:#060a14;--s1:rgba(148,163,184,.055);--s2:rgba(148,163,184,.095);--line:rgba(148,163,184,.14);--line2:rgba(148,163,184,.26);--txt:#eaf1f9;--txt2:#c2d0e2;--mut:#8496ad;--acc:#22d3ee;--accd:rgba(34,211,238,.13);--red:#fb7185;--redd:rgba(251,113,133,.13);--grn:#34d399;--grnd:rgba(52,211,153,.13);--amb:#fbbf24;--ambd:rgba(251,191,36,.13);--vio:#a78bfa;--rl:18px;--rm:14px;--rs:10px}
-@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.38;transform:scale(.76)}}
-@keyframes rise{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
-@keyframes glow{0%,100%{box-shadow:0 10px 34px -12px rgba(251,113,133,.45)}50%{box-shadow:0 10px 44px -8px rgba(251,113,133,.75)}}
-@keyframes sweep{from{transform:translateX(-120%)}to{transform:translateX(320%)}}
+:root{--bg:#070d1a;--bg2:#0b1428;--card:rgba(148,163,184,.07);--line:rgba(148,163,184,.18);--txt:#e8eff8;--mut:#8fa1b8;--acc:#22d3ee;--red:#f87171;--grn:#34d399;--amb:#fbbf24}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html{-webkit-text-size-adjust:100%}
-body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif;background:radial-gradient(90% 46% at 50% -6%,rgba(34,211,238,.15) 0%,transparent 62%),radial-gradient(64% 34% at 90% 4%,rgba(167,139,250,.11) 0%,transparent 58%),linear-gradient(180deg,#0a1326 0%,#070d1a 52%,#05080f 100%);background-attachment:fixed;color:var(--txt);padding:0 14px calc(88px + env(safe-area-inset-bottom));max-width:680px;margin-left:auto;margin-right:auto;line-height:1.55;min-height:100vh;-webkit-font-smoothing:antialiased}
-header{position:sticky;top:0;background:rgba(6,10,20,.82);backdrop-filter:blur(14px) saturate(150%);-webkit-backdrop-filter:blur(14px) saturate(150%);padding:13px 2px 11px;z-index:5;border-bottom:1px solid var(--line)}
-h1{font-size:19px;margin:0 0 9px;letter-spacing:.05em;font-weight:800;display:flex;align-items:center}
-h1::before{content:"";display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--acc);box-shadow:0 0 12px var(--acc);margin-right:9px;animation:pulse 2.4s ease-in-out infinite}
-.badge{display:inline-block;padding:5px 11px;border-radius:999px;font-size:12px;line-height:1.45;margin:2px 5px 2px 0;border:1px solid var(--line2);font-variant-numeric:tabular-nums;font-weight:600;white-space:nowrap}
-.badge.ok{background:var(--grnd);color:#6ee7b7;border-color:rgba(52,211,153,.34)}.badge.warn{background:var(--ambd);color:#fcd34d;border-color:rgba(251,191,36,.34)}.badge.bad{background:var(--redd);color:#fda4af;border-color:rgba(251,113,133,.42)}.badge.info{background:var(--accd);color:#67e8f9;border-color:rgba(34,211,238,.3)}
-.badge.gray{background:var(--s2);color:#a8b8cc;border-color:var(--line)}
-#fallBanner{display:none;background:linear-gradient(180deg,rgba(251,113,133,.24),rgba(251,113,133,.1));border:1px solid rgba(251,113,133,.55);color:#fff;font-weight:700;text-align:center;padding:13px 14px;border-radius:var(--rl);margin:12px 0;font-size:16px;animation:glow 1.7s ease-in-out infinite;position:relative;overflow:hidden}
-#fallBanner .dismiss-btn{display:block;width:100%;margin:12px 0 0;min-height:48px;padding:13px 20px;font-size:16px;font-weight:800;border:0;border-radius:var(--rm);background:#fff;color:#881337;cursor:pointer;box-shadow:0 6px 18px -8px rgba(136,19,58,.7);transition:transform .12s}
-#fallBanner .dismiss-btn:active{transform:translateY(1px)}
-#fallBanner::after{content:"";position:absolute;inset:0;width:36%;background:linear-gradient(90deg,transparent,rgba(255,255,255,.13),transparent);animation:sweep 2.2s linear infinite;pointer-events:none}
-.card{background:linear-gradient(180deg,rgba(255,255,255,.045),rgba(255,255,255,.012));border:1px solid var(--line);border-radius:var(--rl);padding:16px;margin:14px 0;box-shadow:0 10px 34px -18px rgba(0,0,0,.9);animation:rise .45s cubic-bezier(.2,.7,.3,1) both}
-.card h2{font-size:12px;margin:0 0 13px;color:var(--acc);letter-spacing:.16em;font-weight:800;display:flex;align-items:baseline;justify-content:space-between;gap:8px}
-.card h2::after{content:"";flex:1;height:1px;background:linear-gradient(90deg,rgba(34,211,238,.4),transparent);margin-left:2px;align-self:center}
-section.tab{padding:3px 0}
-.hero{text-align:center;padding:26px 14px 22px;position:relative;overflow:hidden}
-.hero::before{content:"";position:absolute;inset:-40% 20% auto;height:150px;background:radial-gradient(50% 50% at 50% 50%,currentColor,transparent 70%);opacity:.13;pointer-events:none}
-.hero-status{font-size:52px;font-weight:800;line-height:1.12;letter-spacing:.05em}
-.hero-status::before{content:"";display:inline-block;width:15px;height:15px;border-radius:50%;margin-right:12px;vertical-align:7px;background:currentColor}
-.hero.present .hero-status{color:var(--grn);text-shadow:0 0 30px rgba(52,211,153,.5)}
-.hero.present .hero-status::before{background:var(--grn);box-shadow:0 0 14px var(--grn),0 0 36px rgba(52,211,153,.65);animation:pulse 2s ease-in-out infinite}
-.hero.absent .hero-status{color:#b7c4d6;text-shadow:0 0 18px rgba(148,163,184,.25)}
-.hero.absent .hero-status::before{background:#64748b;box-shadow:0 0 10px rgba(100,116,139,.7)}
-.hero.waiting .hero-status{color:#94a3b8;font-size:29px;text-shadow:none}
-.hero.waiting .hero-status::before{background:var(--amb);box-shadow:0 0 12px var(--amb);animation:pulse 1.4s ease-in-out infinite}
-.hero.alarm .hero-status{color:var(--red);text-shadow:0 0 30px rgba(251,113,133,.55);animation:pulse 1.15s ease-in-out infinite}
-.hero.alarm .hero-status::before{background:var(--red);box-shadow:0 0 14px var(--red),0 0 36px rgba(251,113,133,.7)}
-.hero-time{font-size:12px;color:var(--mut);margin-top:9px;font-variant-numeric:tabular-nums}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif;background:radial-gradient(120% 60% at 50% -10%,#12314a 0%,transparent 55%),linear-gradient(180deg,#0a1326 0%,#070d1a 60%,#060b16 100%);color:var(--txt);padding:12px 12px 92px;max-width:640px;margin-left:auto;margin-right:auto;line-height:1.5;min-height:100vh}
+header{position:sticky;top:0;background:rgba(7,13,26,.88);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);padding:10px 0 10px;z-index:5;border-bottom:1px solid var(--line)}
+h1{font-size:19px;margin:2px 0 8px;letter-spacing:.04em}
+h1::before{content:"";display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--acc);box-shadow:0 0 10px var(--acc);margin-right:8px;vertical-align:2px}
+.badge{display:inline-block;padding:6px 13px;border-radius:999px;font-size:13px;line-height:1.4;margin:2px 6px 2px 0;border:1px solid var(--line);font-variant-numeric:tabular-nums}
+.ok{background:rgba(52,211,153,.12);color:#6ee7b7;border-color:rgba(52,211,153,.4)}.warn{background:rgba(251,191,36,.12);color:#fcd34d;border-color:rgba(251,191,36,.4)}.bad{background:rgba(248,113,113,.14);color:#fca5a5;border-color:rgba(248,113,113,.45)}.info{background:rgba(34,211,238,.1);color:#67e8f9;border-color:rgba(34,211,238,.35)}
+.gray{background:rgba(148,163,184,.1);color:#a8b8cc;border-color:var(--line)}
+#fallBanner{display:none;background:linear-gradient(180deg,rgba(248,113,113,.22),rgba(248,113,113,.12));border:1px solid rgba(248,113,113,.55);color:#fff;font-weight:bold;text-align:center;padding:14px;border-radius:14px;margin:10px 0;font-size:17px;box-shadow:0 0 24px rgba(248,113,113,.25)}
+.card{background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.015));border:1px solid var(--line);border-radius:16px;padding:16px;margin:14px 0;box-shadow:0 8px 28px rgba(0,0,0,.35)}
+.card h2{font-size:13px;margin:0 0 12px;color:var(--acc);letter-spacing:.14em;font-weight:700}
+.card h2::after{content:"";display:block;height:1px;background:linear-gradient(90deg,rgba(34,211,238,.5),transparent);margin-top:8px}
+section.tab{padding:2px 0}
+.hero{text-align:center;padding:22px 14px 18px}
+.hero-status{font-size:56px;font-weight:800;line-height:1.15;letter-spacing:.04em}
+.hero-status::before{content:"";display:inline-block;width:16px;height:16px;border-radius:50%;margin-right:12px;vertical-align:6px;background:currentColor}
+.hero.present .hero-status{color:var(--grn);text-shadow:0 0 28px rgba(52,211,153,.55)}
+.hero.present .hero-status::before{background:var(--grn);box-shadow:0 0 14px var(--grn),0 0 34px rgba(52,211,153,.7)}
+.hero.absent .hero-status{color:#b7c4d6;text-shadow:0 0 18px rgba(148,163,184,.3)}
+.hero.absent .hero-status::before{background:#64748b;box-shadow:0 0 10px rgba(100,116,139,.8)}
+.hero.waiting .hero-status{color:#94a3b8;font-size:30px;text-shadow:none}
+.hero.waiting .hero-status::before{background:var(--amb);box-shadow:0 0 12px var(--amb)}
+.hero.alarm .hero-status{color:var(--red);text-shadow:0 0 28px rgba(248,113,113,.6)}
+.hero.alarm .hero-status::before{background:var(--red);box-shadow:0 0 14px var(--red),0 0 34px rgba(248,113,113,.7)}
+.hero-time{font-size:13px;color:var(--mut);margin-top:8px;font-variant-numeric:tabular-nums}
 .row{display:flex;flex-wrap:wrap;gap:10px}
-.kv{flex:1 1 138px;background:rgba(6,10,20,.5);border:1px solid var(--line);border-radius:var(--rm);padding:12px 13px;min-height:72px;display:flex;flex-direction:column;justify-content:center}
-.kv .k{font-size:11px;color:var(--mut);letter-spacing:.04em;font-weight:600}
-.kv .v{font-size:23px;margin-top:3px;font-variant-numeric:tabular-nums;font-weight:800;letter-spacing:-.01em}
+.kv{flex:1 1 140px;background:rgba(7,13,26,.55);border:1px solid var(--line);border-radius:12px;padding:12px;min-height:70px}
+.kv .k{font-size:12px;color:var(--mut)}.kv .v{font-size:23px;margin-top:3px;font-variant-numeric:tabular-nums;font-weight:700}
 table{width:100%;border-collapse:collapse;font-size:13px;font-variant-numeric:tabular-nums}
-th,td{border-bottom:1px solid var(--line);padding:10px 5px;text-align:left;word-break:break-all;vertical-align:top}
-th{color:var(--mut);font-size:11px;letter-spacing:.09em;font-weight:700;text-transform:uppercase;position:sticky;top:0;background:rgba(8,13,26,.96);backdrop-filter:blur(6px);z-index:2}
-tbody tr{transition:background .16s}
-tbody tr:active{background:var(--s2)}
-td:nth-child(2){font-weight:700;color:#fda4af}
-canvas{width:100%;background:#050b18;border:1px solid var(--line);border-radius:var(--rm)}
+th,td{border-bottom:1px solid var(--line);padding:9px 4px;text-align:left;word-break:break-all}
+th{color:var(--mut);font-size:12px;letter-spacing:.06em}
+canvas{width:100%;background:#050b18;border:1px solid var(--line);border-radius:12px}
 #roomMap{height:280px}
 #speedCv{height:150px}
-.small{font-size:12px;color:var(--mut);line-height:1.65}
+.small{font-size:12px;color:var(--mut)}
 .tnum{font-variant-numeric:tabular-nums}
-.btn{display:inline-flex;align-items:center;gap:7px;min-height:46px;line-height:1;padding:12px 20px;border-radius:var(--rm);background:linear-gradient(180deg,rgba(34,211,238,.16),rgba(34,211,238,.07));color:#8ef1ff;font-size:15px;font-weight:700;text-decoration:none;border:1px solid rgba(34,211,238,.36);transition:transform .12s,box-shadow .16s;box-shadow:0 6px 20px -10px rgba(34,211,238,.5)}
-.btn:active{transform:translateY(1px);background:linear-gradient(180deg,rgba(34,211,238,.28),rgba(34,211,238,.14))}
-.dev{border:1px solid var(--line);border-radius:var(--rm);padding:13px 14px;margin:9px 0;background:linear-gradient(180deg,rgba(255,255,255,.035),rgba(255,255,255,.01));transition:border-color .16s}
-.dev:active{border-color:var(--line2)}
-.dev .nm{font-size:15px;font-weight:800;display:flex;align-items:center;gap:8px}
-.dev .nm::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--vio);box-shadow:0 0 9px var(--vio);flex:none}
-.dev .meta{font-size:12px;color:var(--mut);margin-top:5px}
-nav#tabbar{position:fixed;left:0;right:0;bottom:0;display:flex;background:rgba(7,12,24,.9);backdrop-filter:blur(16px) saturate(160%);-webkit-backdrop-filter:blur(16px) saturate(160%);border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom);z-index:10;max-width:680px;margin:0 auto}
-nav#tabbar button{flex:1;border:0;background:none;color:#7d8ea6;font-size:12px;font-weight:700;min-height:60px;padding:9px 2px 11px;cursor:pointer;border-top:2px solid transparent;position:relative;transition:color .18s,background .18s;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px}
-nav#tabbar button::before{content:"";width:20px;height:20px;border-radius:7px;background:currentColor;opacity:.28;-webkit-mask:var(--ico) center/contain no-repeat;mask:var(--ico) center/contain no-repeat}
-nav#tabbar button[data-tab=overview]{--ico:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round'%3E%3Cpath d='M4 13h6V4H4zM14 20h6v-9h-6zM4 20h6v-4H4zM14 8h6V4h-6z'/%3E%3C/svg%3E")}
-nav#tabbar button[data-tab=track]{--ico:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round'%3E%3Cpath d='M3 17c3-6 6 4 9-2s6 4 9-2'/%3E%3Ccircle cx='12' cy='15' r='1.6' fill='%23000'/%3E%3C/svg%3E")}
-nav#tabbar button[data-tab=alarms]{--ico:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round'%3E%3Cpath d='M6 9a6 6 0 1 1 12 0c0 5 2 6 2 6H4s2-1 2-6'/%3E%3Cpath d='M10 20a2 2 0 0 0 4 0'/%3E%3C/svg%3E")}
-nav#tabbar button[data-tab=devices]{--ico:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round'%3E%3Crect x='4' y='4' width='16' height='16' rx='3'/%3E%3Cpath d='M9 9h6v6H9z'/%3E%3C/svg%3E")}
-nav#tabbar button[data-tab=photos]{--ico:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round'%3E%3Crect x='3' y='5' width='18' height='14' rx='3'/%3E%3Ccircle cx='9' cy='10' r='1.8'/%3E%3Cpath d='M4 17l5-4 4 3 3-2 4 3'/%3E%3C/svg%3E")}
-nav#tabbar button[data-tab=about]{--ico:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2.2' stroke-linecap='round'%3E%3Ccircle cx='12' cy='12' r='9'/%3E%3Cpath d='M12 11v5M12 8v.01'/%3E%3C/svg%3E")}
-nav#tabbar button.active{color:var(--acc);background:linear-gradient(180deg,rgba(34,211,238,.12),transparent)}
-nav#tabbar button.active::before{opacity:1}
-nav#tabbar button.alarmdot::after{content:"";position:absolute;top:7px;right:calc(50% - 20px);width:8px;height:8px;border-radius:50%;background:var(--red);box-shadow:0 0 9px var(--red);animation:pulse 1.3s ease-in-out infinite}
+.btn{display:inline-block;min-height:48px;line-height:24px;padding:12px 22px;border-radius:12px;background:rgba(34,211,238,.12);color:#67e8f9;font-size:16px;font-weight:bold;text-decoration:none;border:1px solid rgba(34,211,238,.5)}
+.btn:active{background:rgba(34,211,238,.25)}
+.dev{border:1px solid var(--line);border-radius:12px;padding:12px;margin:8px 0;background:rgba(7,13,26,.55)}
+.dev .nm{font-size:16px;font-weight:bold}
+.dev .meta{font-size:13px;color:var(--mut);margin-top:4px}
+nav#tabbar{position:fixed;left:0;right:0;bottom:0;display:flex;background:rgba(9,16,32,.94);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom);z-index:10}
+nav#tabbar button{flex:1;border:0;background:none;color:#7d8ea6;font-size:16px;min-height:64px;padding:10px 4px 12px;cursor:pointer;border-top:3px solid transparent}
+nav#tabbar button.active{color:#fff;background:rgba(34,211,238,.08);font-weight:800;border-top-color:var(--acc)}
 section.tab{display:none}
 section.tab.active{display:block}
-.arch div{padding:10px 12px;background:rgba(6,10,20,.5);border:1px solid var(--line);border-radius:var(--rm);margin:7px 0;font-size:13px;color:var(--txt2)}
-.rule-row{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;padding:10px 12px;background:rgba(6,10,20,.5);border:1px solid var(--line);border-radius:var(--rm);margin:7px 0}
-.rule-k{font-size:13px;color:var(--txt);font-weight:700}
-.rule-d{display:block;font-size:11px;font-weight:400;color:var(--mut);margin-top:3px;line-height:1.5}
-.rule-v{font-size:15px;color:var(--acc);white-space:nowrap;font-variant-numeric:tabular-nums}
-.pgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px}
-.pgrid img{width:100%;height:96px;object-fit:cover;border-radius:var(--rs);background:#050b18;cursor:pointer;border:1px solid var(--line);transition:transform .14s,border-color .14s}
-.pgrid img:active{transform:scale(.97);border-color:var(--acc)}
-.latestImg{width:100%;max-height:230px;object-fit:cover;border-radius:var(--rm);cursor:pointer;border:1px solid var(--line);background:#050b18}
-#photoOverlay{display:none;position:fixed;inset:0;background:rgba(2,4,9,.94);z-index:50;align-items:center;justify-content:center;padding:14px;backdrop-filter:blur(4px)}
-#photoOverlay.active{display:flex;animation:rise .2s ease both}
-#photoOverlay img{max-width:100%;max-height:100%;border-radius:var(--rm);box-shadow:0 24px 70px rgba(0,0,0,.75)}
-.tl{position:relative;margin:12px 0 2px;padding-left:24px;font-variant-numeric:tabular-nums}
-.tl::before{content:"";position:absolute;left:7px;top:8px;bottom:8px;width:2px;background:linear-gradient(180deg,rgba(34,211,238,.6),rgba(34,211,238,.05));border-radius:2px}
-.tl-item{position:relative;background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.012));border:1px solid var(--line);border-radius:var(--rm);padding:11px 13px;margin:0 0 10px;animation:rise .3s ease both}
-.tl-item::before{content:"";position:absolute;left:-22px;top:16px;width:10px;height:10px;border-radius:50%;background:var(--acc);box-shadow:0 0 9px var(--acc)}
-.tl-item.crit{border-color:rgba(251,113,133,.4);background:linear-gradient(180deg,rgba(251,113,133,.1),rgba(251,113,133,.02))}
-.tl-item.crit::before{background:var(--red);box-shadow:0 0 11px var(--red)}
+.arch div{padding:9px 10px;background:rgba(7,13,26,.55);border:1px solid var(--line);border-radius:10px;margin:6px 0;font-size:14px}
+.pgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.pgrid img{width:100%;height:90px;object-fit:cover;border-radius:10px;background:#050b18;cursor:pointer;border:1px solid var(--line)}
+.latestImg{width:100%;max-height:220px;object-fit:cover;border-radius:12px;cursor:pointer;border:1px solid var(--line)}
+#photoOverlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:50;align-items:center;justify-content:center;padding:12px}
+#photoOverlay.active{display:flex}
+#photoOverlay img{max-width:100%;max-height:100%;border-radius:8px}
+.tl{position:relative;margin:10px 0 2px;padding-left:24px;font-variant-numeric:tabular-nums}
+.tl::before{content:"";position:absolute;left:7px;top:6px;bottom:6px;width:2px;background:linear-gradient(180deg,var(--acc),rgba(34,211,238,.08));border-radius:2px}
+.tl-item{position:relative;background:rgba(7,13,26,.55);border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin:0 0 10px}
+.tl-item::before{content:"";position:absolute;left:-22px;top:14px;width:10px;height:10px;border-radius:50%;background:var(--acc);box-shadow:0 0 8px var(--acc)}
+.tl-item.crit::before{background:var(--red);box-shadow:0 0 10px var(--red)}
 .tl-item.warn2::before{background:var(--amb);box-shadow:0 0 10px var(--amb)}
-.tl-time{font-size:11px;color:var(--acc);font-weight:700;font-variant-numeric:tabular-nums}
-.tl-type{font-size:14px;font-weight:800;margin:3px 0}
-.tl-detail{font-size:12px;color:var(--txt2);word-break:break-all;line-height:1.6}
-#trackList{font-variant-numeric:tabular-nums;display:flex;flex-direction:column;gap:7px}
-#trackList div{padding:9px 11px;background:rgba(6,10,20,.5);border:1px solid var(--line);border-radius:var(--rs);font-size:12px;color:var(--txt2)}
-.map-legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:9px}
-.map-legend span{font-size:11px;color:var(--mut)}
+.tl-time{font-size:12px;color:var(--acc);font-weight:700}
+.tl-type{font-size:14px;font-weight:700;margin:2px 0}
+.tl-detail{font-size:13px;color:#c6d3e4;word-break:break-all}
+#trackList{font-variant-numeric:tabular-nums}
+#trackList div{padding:7px 10px;background:rgba(7,13,26,.55);border:1px solid var(--line);border-radius:10px;margin:6px 0;font-size:13px}
+.map-legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px}
+.map-legend span{font-size:12px;color:var(--mut)}
 .map-legend i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px;font-style:normal}
-.empty{padding:26px 10px;text-align:center;color:var(--mut);font-size:13px}
-@media (max-width:400px){.hero-status{font-size:44px}.kv{flex:1 1 100px}.kv .v{font-size:20px}}
-@media (prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;animation-iteration-count:1!important}}
 </style>
 </head>
 <body>
 <header>
 <h1>老人跌倒监护</h1>
 <div><span id="netBadge" class="badge info">加载中…</span><span id="mqttBadge" class="badge gray" style="display:none">网关离线</span><span id="clockBadge" class="badge info">—</span></div>
-<div id="fallBanner"><span style="position:relative;z-index:1">⚠ 跌倒报警！请立即查看老人情况 <span id="fallAge"></span></span><button id="dismissBtn" class="dismiss-btn" style="position:relative;z-index:1">已知晓</button></div>
+<div id="fallBanner">⚠ 跌倒报警！请立即查看老人情况 <span id="fallAge"></span> <button id="dismissBtn" style="margin-left:10px;min-height:48px;padding:12px 20px;font-size:16px;border:0;border-radius:10px;background:#fff;color:#7f1d1d;font-weight:bold;cursor:pointer">已知晓</button></div>
 </header>
 
 <section id="tab-overview" class="tab active">
@@ -462,7 +662,7 @@ section.tab.active{display:block}
 <div class="kv"><div class="k">心率 BPM</div><div class="v" id="ovBpm">—</div></div>
 <div class="kv"><div class="k">血氧 SpO2 %</div><div class="v" id="ovSpo2">—</div></div>
 </div><div class="small">MAX30102 未佩戴（或读数野值）时显示“未佩戴”。</div></div>
-<div class="card" id="latestCard" style="display:none"><h2>最近抓拍</h2><img id="latestImg" class="latestImg" alt="最近抓拍"><div class="small" id="latestTime"></div></div>
+<div class="card" id="latestCard" style="display:none"><h2>最近抓拍</h2><img id="latestImg" class="latestImg" loading="lazy" alt="最近抓拍"><div class="small" id="latestTime"></div></div>
 </section>
 
 <section id="tab-track" class="tab">
@@ -475,7 +675,7 @@ section.tab.active{display:block}
 <div class="small">坐标 x/y 单位毫米；径向速度=朝向/远离雷达分量（横走≈0），报警判定用位移速度（见速度曲线卡片）。</div></div>
 <div class="card"><h2>速度曲线（第一目标 · 位移速度）</h2>
 <canvas id="speedCv" width="600" height="150"></canvas>
-<div class="small">曲线=两帧坐标位移算出的真速度（横走也可见）；红色虚线为「静止阈值」，低于它视为静止；报警 = 活动后 3 秒内骤停 + 静止满 3 秒（阈值见「关于」页，读 rules.json）。</div></div>
+<div class="small">曲线=两帧坐标位移算出的真速度（横走也可见）；100 cm/s 红色虚线为静止分界参考，非报警线；报警 = 1m/s 活动后 3 秒内骤停 + 静止 3 秒。</div></div>
 </section>
 
 <section id="tab-alarms" class="tab">
@@ -503,26 +703,6 @@ section.tab.active{display:block}
 <div>应用层：本页面（总览 / 轨迹 / 报警 / 设备 / 相册 / 关于），判决不依赖存在检测</div>
 </div>
 <div class="small">离线优先：断网本地照常判断与报警，不依赖外网，不存密码。<br>演示四步：存在 / 跌倒模拟 / 按键求助 / 断网本地报警。</div></div>
-<div class="card"><h2>判定逻辑说明</h2><div class="arch">
-<div><b>速度来源</b>：由两帧雷达坐标位移 / 时间差算出真实速度（EMA 平滑），横走也可见；不使用 LD2450 径向 speed 字段（横走读数≈0）</div>
-<div><b>默认模式</b>：活动后 3 秒内骤停 + 静止保持 3 秒 → 触发跌倒报警，冷却 30 秒</div>
-<div><b>融合模式</b>：MPU6050 合加速度尖峰（&gt;25000）→ 10 秒窗口内静止 3 秒 → 触发，抗单人坐卧误报</div>
-<div><b>报警动作</b>：写 alarms.jsonl + 异步抓拍 *_food.jpg（不阻塞判定循环）+ MQTT 广播 + 本页横幅与蜂鸣</div>
-</div></div>
-<div class="card"><h2>当前判定参数 <span id="rulesState" class="small"></span></h2>
-<div id="rulesList" class="arch">读取中…</div>
-<div class="small">改 rules.json 后需重启 main.py 才生效（<code>sudo systemctl restart food_project.service</code>），本页每 30 秒刷新一次。</div></div>
-<div class="card"><h2>数据文件</h2><div class="arch">
-<div>status.json — 每 0.5s 原子写入，雷达 / 温湿度 / 心率 / 按键快照</div>
-<div>alarms.jsonl — 报警流水，每行一条 JSON，导出 CSV 取最近 1000 条</div>
-<div>*_food.jpg — 报警时抓拍，保留最近 20 张于相册页</div>
-<div>devices.json / rules.json — 设备清单与判定阈值</div>
-</div></div>
-<div class="card"><h2>已知限制</h2><div class="arch">
-<div>弱光环境抓拍偏暗（ov5647 + 500ms 曝光），建议报警时补光或延长曝光</div>
-<div>心率血氧为 MAX30102 透射式，须夹住手指；脱落时读数 250/74.7% 属野值，界面显示“未佩戴”</div>
-<div>存在状态由雷达目标数决定，老人静止坐卧仍可能计为“无人”，不影响跌倒判定</div>
-</div></div>
 </section>
 
 <div id="photoOverlay"><img id="photoFull" alt="抓拍大图"></div>
@@ -544,7 +724,6 @@ var currentBannerId = "";
 var audioCtx = null;
 var trails = [[], [], []];
 var alarmActive = false;
-var stillThr = 50;   // 静止阈值（cm/s），从 /api/rules 读到后覆盖，画速度曲线用
 var dispPrev = {ok:false, x:0, y:0, t:0};
 var dispEma = 0;
 document.querySelectorAll("#tabbar button").forEach(function(b){
@@ -648,9 +827,9 @@ function drawCurve(){
   var c = document.getElementById("speedCv"), ctx = c.getContext("2d");
   ctx.clearRect(0,0,c.width,c.height);
   ctx.strokeStyle = "rgba(148,163,184,.25)"; ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(0,c.height); ctx.moveTo(0,c.height-1); ctx.lineTo(c.width,c.height-1); ctx.stroke();
-  var maxV = 150, y = c.height - (stillThr/maxV)*c.height;
+  var maxV = 150, y = c.height - (100/maxV)*c.height;
   ctx.strokeStyle = "#f87171"; ctx.setLineDash([5,4]); ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(c.width,y); ctx.stroke(); ctx.setLineDash([]);
-  ctx.fillStyle = "#8fa1b8"; ctx.font = "12px sans-serif"; ctx.fillText("静止阈值" + stillThr, 6, y-4);
+  ctx.fillStyle = "#8fa1b8"; ctx.font = "12px sans-serif"; ctx.fillText("静止分界100", 6, y-4);
   if(speedHist.length < 2) return;
   ctx.strokeStyle = "#22d3ee"; ctx.lineWidth = 2; ctx.beginPath();
   for(var i=0;i<speedHist.length;i++){
@@ -702,9 +881,9 @@ function renderStatus(s){
   document.getElementById("ovSteps").textContent = (s.steps===undefined||s.steps===null) ? "—" : s.steps;
   document.getElementById("ovTempTime").textContent = "采样时间：" + (s.temp_recorded_at || "—");
   var _bpm = Number(s.bpm);
-  document.getElementById("ovBpm").textContent = (!_bpm || _bpm <= 0 || _bpm > 200) ? "未佩戴" : String(Math.round(_bpm));
+  document.getElementById("ovBpm").textContent = (!_bpm || _bpm <= 0 || _bpm > 200) ? "未佩戴" : s.bpm;
   var _spo2 = Number(s.spo2);
-  document.getElementById("ovSpo2").textContent = (!_spo2 || _spo2 <= 0 || _spo2 < 70) ? "未佩戴" : _spo2.toFixed(1);
+  document.getElementById("ovSpo2").textContent = (!_spo2 || _spo2 <= 0 || _spo2 < 70) ? "未佩戴" : s.spo2;
   var html = "";
   (s.radar_targets||[]).forEach(function(t,i){
     html += "<div>目标"+(i+1)+"：x="+fmt(t.x,0)+"mm y="+fmt(t.y,0)+"mm 径向速度="+fmt(t.speed,1)+"cm/s 距离="+fmt(t.dist,2)+"m</div>";
@@ -753,7 +932,7 @@ function renderAlarms(list){
       var detail = it.detail !== undefined ? it.detail : (it.message !== undefined ? it.message : JSON.stringify(it));
       var tm = it.time||it.timestamp||it.created_at||"—";
       var cls = (/跌倒|求助|按键|fall|button/i.test(ty + detail)) ? "crit" : ((/警告|离线|warn/i.test(ty + detail)) ? "warn2" : "");
-      th += "<div class=\\"tl-item "+cls+"\\"><div class=\\"tl-time\\">"+esc(tm)+"</div><div class=\\"tl-type\\">"+esc(ty)+"</div><div class=\\"tl-detail\\">"+esc(detail)+"</div></div>";
+      th += "<div class='tl-item '+cls+''><div class='tl-time'>"+esc(tm)+"</div><div class='tl-type'>"+esc(ty)+"</div><div class='tl-detail'>"+esc(detail)+"</div></div>";
     });
     tl.innerHTML = th;
   }
@@ -789,10 +968,10 @@ function renderDevices(list){
   if(!list.length){ box.textContent = "暂无设备信息（缺 devices.json，属正常）"; return; }
   var h = "";
   list.forEach(function(d){
-    h += "<div class=\\"dev\\"><div class=\\"nm\\">"+esc(d.name||d.id||"未命名设备")+"</div>"
-      + "<div class=\\"meta\\">编号：" + esc(d.id||"—") + " · 层级：" + esc(d.layer||"—") + "</div>"
-      + "<div class=\\"meta\\">接口：" + esc(d.interface||"—") + "</div>"
-      + (d.note ? "<div class=\\"meta\\">备注：" + esc(d.note) + "</div>" : "") + "</div>";
+    h += "<div class='dev'><div class='nm'>"+esc(d.name||d.id||"未命名设备")+"</div>"
+      + "<div class='meta'>编号：" + esc(d.id||"—") + " · 层级：" + esc(d.layer||"—") + "</div>"
+      + "<div class='meta'>接口：" + esc(d.interface||"—") + "</div>"
+      + (d.note ? "<div class='meta'>备注：" + esc(d.note) + "</div>" : "") + "</div>";
   });
   box.innerHTML = h;
 }
@@ -814,19 +993,10 @@ document.getElementById("latestImg").addEventListener("click", function(){
 function renderPhotos(list){
   var box = document.getElementById("photoGrid");
   document.getElementById("photoCount").textContent = "（共 " + list.length + " 张）";
-  if(!list.length){ box.textContent = "暂无照片"; box.dataset.sig = ""; return; }
-  // 关键：tick() 每 600ms 调一次本函数。若无条件重建 innerHTML，20 张图每次
-  // 都被销毁重建，浏览器来不及下载完就又重来 → naturalWidth 永远为 0（白框）。
-  // 所以只在照片列表真的变化时才重建 DOM。
-  var sig = list.map(function(p){ return p.name; }).join("|");
-  if(box.dataset.sig === sig) return;
-  box.dataset.sig = sig;
-  // 不用 loading="lazy"：本项目只有 20 张图（局域网 ~5MB），而 lazy 在部分
-  // 环境下（后台标签/无头浏览器/容器滚动）不会触发加载，表现为永远空白。
-  // 配合上面的 sig 去重，图片只会被请求一次。
+  if(!list.length){ box.textContent = "暂无照片"; return; }
   var h = "";
   list.forEach(function(p){
-    h += '<img src="/photo/' + encodeURIComponent(p.name) + '" alt="' + esc(p.name) + '" data-name="' + esc(p.name) + '">';
+    h += "<img loading='lazy' src='/photo/" + encodeURIComponent(p.name) + "' alt='" + esc(p.name) + "' data-name='" + esc(p.name) + "'>";
   });
   box.innerHTML = h;
   box.querySelectorAll("img").forEach(function(im){
@@ -839,51 +1009,9 @@ function renderLatest(list){
   var p = list[0];
   card.style.display = "block";
   var im = document.getElementById("latestImg");
-  // 同上：src 没变就不要重设，否则每次 tick 都重新拉一遍图
-  if(im.dataset.name !== p.name){
-    im.src = "/photo/" + encodeURIComponent(p.name);
-    im.dataset.name = p.name;
-  }
+  im.src = "/photo/" + encodeURIComponent(p.name);
+  im.dataset.name = p.name;
   document.getElementById("latestTime").textContent = p.mtime || p.name;
-}
-function renderRules(d){
-  var box = document.getElementById("rulesList");
-  var st = document.getElementById("rulesState");
-  if(!box) return;
-  if(!d || d.ok === false || !(d.items||[]).length){
-    box.innerHTML = "<div>暂无 rules.json（使用内置默认阈值）</div>";
-    if(st) st.textContent = "默认值";
-    return;
-  }
-  var h = "";
-  (d.items||[]).forEach(function(r){
-    var v = (typeof r.value === "number") ? String(r.value) : esc(r.value);
-    h += '<div class="rule-row"><span class="rule-k">' + esc(r.label||r.key)
-      + '<span class="rule-d">' + esc(r.desc||"") + ' · ' + esc(r.key) + '</span></span>'
-      + '<b class="rule-v">' + v + '</b></div>';
-  });
-  box.innerHTML = h;
-  if(st) st.textContent = "共 " + d.items.length + " 项";
-  // 同步静止阈值到速度曲线（曲线画在轨迹 tab，两处必须一致）
-  (d.items||[]).forEach(function(r){
-    if(r.key === "still_speed_threshold"){
-      var n = Number(r.value);
-      if(!isNaN(n) && n > 0){ stillThr = n; drawCurve(); }
-    }
-  });
-}
-// 启动时先拉一次 rules，保证速度曲线的阈值线在打开轨迹 tab 前就是对的
-async function primeRules(){
-  try{
-    var d = await fetchJSON("/api/rules");
-    (d && d.items || []).forEach(function(r){
-      if(r.key === "still_speed_threshold"){
-        var n = Number(r.value);
-        if(!isNaN(n) && n > 0) stillThr = n;
-      }
-    });
-    drawCurve();
-  }catch(e){}
 }
 async function tick(){
   // 顶栏徽标 + 横幅/蜂鸣常驻（所有 tab 可见）；各 tab 专属数据按 activeTab 按需拉取
@@ -916,23 +1044,52 @@ async function tick(){
       renderLatest(plist);
     }catch(e){}
   }
-  if(activeTab === "about"){
-    try{
-      var r = await fetchJSON("/api/rules");
-      renderRules(r);
-    }catch(e){}
-  }
 }
-var _rulesTs = 0;
-setInterval(function(){
-  var n = Date.now();
-  if(activeTab === "about" && n - _rulesTs > 30000){ _rulesTs = n; tick(); }
-}, 1000);
-tick(); setInterval(tick, 600); primeRules();
+var liveSocket = null;
+var liveSocketReady = false;
+var socketRetryDelay = 1000;
+var loadStatusCache = {};
+function connectLiveSocket(){
+  try{
+    var proto = location.protocol === "https:" ? "wss://" : "ws://";
+    liveSocket = new WebSocket(proto + location.host + "/ws");
+    liveSocket.onopen = function(){
+      liveSocketReady = true;
+      socketRetryDelay = 1000;
+      renderStatus(loadStatusCache || {});
+    };
+    liveSocket.onmessage = function(evt){
+      try{
+        var data = JSON.parse(evt.data);
+        var s = data && data.status ? data.status : data;
+        if(s && typeof s === "object"){ loadStatusCache = s; renderStatus(s); }
+      }catch(e){}
+    };
+    liveSocket.onclose = function(){ scheduleLiveSocket(); };
+    liveSocket.onerror = function(){ scheduleLiveSocket(); };
+  }catch(e){ scheduleLiveSocket(); }
+}
+function scheduleLiveSocket(){
+  if(liveSocketReady || liveSocket){ liveSocketReady = false; try{ liveSocket.close(); }catch(e){} }
+  liveSocket = null;
+  setTimeout(connectLiveSocket, socketRetryDelay);
+  socketRetryDelay = Math.min(5000, socketRetryDelay * 2);
+}
+connectLiveSocket();
+tick(); setInterval(function(){ if(!liveSocketReady) tick(); }, 600);
 </script>
 </body>
 </html>
 """
+
+
+# Prefer the editable production UI beside the server; keep the embedded page as rollback fallback.
+UI_FILE = os.path.join(BASE_DIR, "index.html")
+try:
+    with open(UI_FILE, "r", encoding="utf-8") as _ui_file:
+        PAGE = _ui_file.read()
+except (OSError, UnicodeError):
+    pass
 
 
 # ---------------------------------------------------------------- HTTP 服务
@@ -942,12 +1099,50 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def _handle_websocket(self):
+        key = self.headers.get("Sec-WebSocket-Key")
+        if not key:
+            self._send(400, "缺少 WebSocket 握手头", "text/plain; charset=utf-8")
+            return
+        accept = accept_key(key.strip())
+        handshake = (
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+        ).encode("ascii")
+        self.wfile.write(handshake)
+        self.wfile.flush()
+        peer = WS_HUB.add(self.connection, self.wfile)
+        peer.send(live_snapshot())
+        self.close_connection = True
+        try:
+            self.connection.settimeout(1.0)
+            while not peer.closed:
+                readable, _, _ = select.select([self.connection], [], [], 1.0)
+                if not readable:
+                    continue
+                data = self.connection.recv(2)
+                if not data:
+                    break
+                if data[0] & 0x0F == 0x8:
+                    break
+        except (OSError, ValueError):
+            pass
+        finally:
+            WS_HUB.remove(peer)
+
     def _send(self, code, body, ctype):
         if isinstance(body, str):
             body = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        # The dashboard and status APIs are live operational data. Avoid a
+        # phone/browser cache showing yesterday's page during a demo.
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.end_headers()
         self.wfile.write(body)
 
@@ -958,10 +1153,31 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps({"error": "encode failed: %s" % e}, ensure_ascii=False)
         self._send(200, body, "application/json; charset=utf-8")
 
+    def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        if path != "/api/ack":
+            self._send(404, "未找到", "text/plain; charset=utf-8")
+            return
+        try:
+            length = min(int(self.headers.get("Content-Length", "0") or 0), 4096)
+            raw = self.rfile.read(length) if length else b"{}"
+            payload = json.loads(raw.decode("utf-8", "replace"))
+            if not isinstance(payload, dict):
+                raise ValueError("请求体必须是 JSON 对象")
+            event_id = payload.get("event_id")
+            if not acknowledge_alarm(event_id, payload.get("actor", "现场操作员")):
+                self._send_json({"ok": False, "error": "缺少 event_id 或无法写入确认记录"})
+                return
+            self._send_json({"ok": True, "event_id": str(event_id)})
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)})
+
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         try:
-            if path == "/" or path == "/index.html":
+            if path == "/ws" and self.headers.get("Upgrade", "").lower() == "websocket":
+                self._handle_websocket()
+            elif path == "/" or path == "/index.html":
                 self._send(200, PAGE, "text/html; charset=utf-8")
             elif path == "/api/status":
                 try:
@@ -980,6 +1196,11 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"devices": devs, "count": len(devs)})
                 except Exception as e:
                     self._send_json({"error": str(e)})
+            elif path == "/api/nodes":
+                try:
+                    self._send_json(node_payload())
+                except Exception as e:
+                    self._send_json({"error": str(e), "nodes": []})
             elif path == "/api/photos":
                 try:
                     photos = load_photos(20)
@@ -994,13 +1215,9 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_header("Content-Type", "text/csv; charset=utf-8")
                     self.send_header("Content-Disposition", 'attachment; filename="alarms.csv"')
                     self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
                     self.end_headers()
                     self.wfile.write(body)
-                except Exception as e:
-                    self._send_json({"error": str(e)})
-            elif path == "/api/rules":
-                try:
-                    self._send_json(load_rules())
                 except Exception as e:
                     self._send_json({"error": str(e)})
             elif path.startswith("/photo/"):
@@ -1023,9 +1240,25 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:
                     self._send_json({"error": str(e)})
             elif path == "/manifest.json":
-                self._send(200, '{"name":"老人跌倒监护","short_name":"跌倒监护","display":"standalone","start_url":"/","theme_color":"#070d1a","background_color":"#070d1a","icons":[{"src":"/icon.svg","sizes":"any","type":"image/svg+xml"}]}', "application/manifest+json; charset=utf-8")
+                self._send(200, '{"name":"老人跌倒监护","short_name":"跌倒监护","display":"standalone","start_url":"/","theme_color":"#f3f7f6","background_color":"#f3f7f6","icons":[{"src":"/icon.svg","sizes":"any","type":"image/svg+xml"}]}', "application/manifest+json; charset=utf-8")
             elif path == "/icon.svg":
-                self._send(200, '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#070d1a"/><path d="M18 42a22 22 0 0 1 0-20M26 42a12 12 0 0 1 0-14M34 42a4 4 0 0 1 0-8" stroke="#22d3ee" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="34" cy="38" r="4" fill="#22d3ee"/></svg>', "image/svg+xml")
+                self._send(200, '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#0f766e"/><path d="M18 42a22 22 0 0 1 0-20M26 42a12 12 0 0 1 0-14M34 42a4 4 0 0 1 0-8" stroke="#ffffff" stroke-width="4" fill="none" stroke-linecap="round"/><circle cx="34" cy="38" r="4" fill="#ffffff"/></svg>', "image/svg+xml")
+            elif path == "/api/health":
+                status_mtime = _safe_mtime(STATUS_FILE)
+                alarms_mtime = _safe_mtime(ALARMS_FILE)
+                now = time.time()
+                self._send_json({
+                    "ok": True,
+                    "websocket_clients": WS_HUB.count(),
+                    "transport": "websocket" if WS_HUB.count() else "polling",
+                    "status_age_s": None if status_mtime is None else round(max(0.0, now - status_mtime), 2),
+                    "alarms_age_s": None if alarms_mtime is None else round(max(0.0, now - alarms_mtime), 2),
+                    "status_file": os.path.basename(STATUS_FILE),
+                    "alarms_file": os.path.basename(ALARMS_FILE),
+                    "mqtt": bool(load_status().get("mqtt", False)),
+                    "outbox_pending": load_status().get("outbox_pending", 0),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                })
             else:
                 self._send(404, "未找到", "text/plain; charset=utf-8")
         except Exception as e:
@@ -1037,6 +1270,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    threading.Thread(target=_watch_live_files, name="websocket-live-watcher", daemon=True).start()
     try:
         ip = socket.gethostbyname(socket.gethostname())
     except Exception:
@@ -1058,3 +1292,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
